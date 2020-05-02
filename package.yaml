@@ -38,8 +38,6 @@ dependencies:
 - unliftio-core >= 0.1.2.0
 - word-wrap >= 0.4.1
 - text >= 1.2.3.1
-# - cassava >= 0.5.2.0
-# - vector >= 0.12.0.3
 
 library:
   source-dirs: lib/
@@ -52,7 +50,7 @@ library:
 
 executables:
   rofi-bw:
-    main: rofi-bitwarden.hs
+    main: rofi-bw.hs
     source-dirs: app
     ghc-options:
     - -Wall
@@ -61,7 +59,7 @@ executables:
     dependencies:
     - rofi-extras
   rofi-dev:
-    main: rofi-devices.hs
+    main: rofi-dev.hs
     source-dirs: app
     ghc-options:
     - -Wall
