@@ -43,6 +43,7 @@ import           System.Process
 main :: IO ()
 main = runChecks >> getArgs >>= parse
 
+-- TODO check if daemon is running when running client
 parse :: [String] -> IO ()
 parse ["-d", t] = case readMaybe t of { Just t' -> runDaemon t'; _ -> usage }
 parse ("-c":args) = runClient args
@@ -78,6 +79,7 @@ newtype BWServerConf = BWServerConf
     { timeout :: UnixDiffTime
     }
 
+-- TODO add a cache so the browse list will load faster
 data CurrentSession = CurrentSession
     { timestamp :: UnixTime
     , hash      :: String

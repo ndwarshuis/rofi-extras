@@ -84,6 +84,7 @@ type Password = IO (Maybe String)
 
 type MountpointPasswords = M.Map String Password
 
+-- TODO check if mountdir exists or puke
 data MountConf = MountConf
     { passwords :: MountpointPasswords
     , mountDir  :: FilePath
