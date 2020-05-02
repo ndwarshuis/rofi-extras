@@ -185,7 +185,7 @@ data Removable = Removable
 
 instance Mountable Removable where
   mount Removable { deviceSpec = d, label = l } m =
-    io $ runMountNotify "mount" [c, "-b", d] l m
+    io $ runMountNotify "udisksctl" [c, "-b", d] l m
     where
       c = if m then "unmount" else "mount"
 
