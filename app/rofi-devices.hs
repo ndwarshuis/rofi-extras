@@ -2,6 +2,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 
+--------------------------------------------------------------------------------
+-- | rofi-dev - a rofi prompt for mountable devices
+--
+-- Like all "mount helpers" this is basically a wrapper for low-level utilities
+-- the mount things from the command line. It also creates/destroys mountpoint
+-- paths given a specific location for such mountpoints.
+
 module Main (main) where
 
 import           Control.Monad
@@ -31,35 +38,20 @@ import           System.Process
 import           UnliftIO.Exception
 
 main :: IO ()
-main = check >> getArgs >>= parse
+main = getArgs >>= parse
 
-type Password = IO (Maybe String)
-
-data MountConf = MountConf
-    { credentials :: M.Map String Password
-    , mountDir    :: FilePath
-    , rofiArgs    :: [String]
-    }
-
-instance RofiConf MountConf where
-  defArgs MountConf { rofiArgs = a } = a
-
-
-type DevicePasswords = M.Map String Password
-
-initMountConf :: [String] -> IO MountConf
-initMountConf a = conf <$> getEffectiveUserName
+parse :: [String] -> IO ()
+parse args = case getOpt Permute options args of
+  (o, n, [])   -> initMountConf n >>= \i -> runMounts $ foldl (flip id) i o
+  (_, _, errs) -> ioError $ userError $ concat errs ++ usageInfo h options
   where
-    conf u = MountConf
-      { credentials = M.empty
-      , mountDir = "/media" </> u
-      , rofiArgs = a
-      }
+    h = "Usage: rofi-dev [OPTIONS] [-- ROFI-OPTIONS]"
 
+-- TODO add option to look up password in bitwarden vault
 options :: [OptDescr (MountConf -> MountConf)]
 options =
   [ Option ['s'] ["secret"]
-    (ReqArg (\s m -> m { credentials = addGetSecret (credentials m) s } ) "SECRET")
+    (ReqArg (\s m -> m { passwords = addSecret (passwords m) s } ) "SECRET")
     $ wrap "Use libsecret to retrieve password for DIR using ATTR/VAL pairs. \
            \The pairs will be supplied to a 'secret-tool lookup' call. \
            \ Argument is formatted like 'DIR:ATTR1=VAL1,ATTR2=VAL2...'"
@@ -72,53 +64,68 @@ options =
            \mountpoint does not already exist for them. If not given this will \
            \default to '/media/USER'."
   , Option ['p'] ["password"]
-    (ReqArg (\s m -> m { credentials = addGetPrompt (credentials m) s } ) "DIR")
+    (ReqArg (\s m -> m { passwords = addPwdPrompt (passwords m) s } ) "DIR")
     "Prompt for password when mounting DIR."
   ]
   where
     wrap = unpack . wrapText defaultWrapSettings 40
 
-parse :: [String] -> IO ()
-parse args = case getOpt Permute options args of
-  (o, n, [])   -> initMountConf n >>= \i -> runMounts $ foldl (flip id) i o
-  (_, _, errs) -> ioError $ userError $ concat errs ++ usageInfo h options
-  where
-    h = "Usage: rofi-dev [OPTIONS] [-- ROFI-OPTIONS]"
+--------------------------------------------------------------------------------
+-- | Static configuration
+--
+-- This is defined by the mount options on the command line, and holds:
+-- - a map between mountpoints and a means to get passwords when mounting those
+--   mountpoints
+-- - a mount directory where mountpoints will be created if needed (defaults
+--   to '/media/USER'
+-- - any arguments to be passed to the rofi command
 
-addGetSecret :: DevicePasswords -> String -> DevicePasswords
-addGetSecret pwds c = case splitPrefix c of
-  (dir, ":", r) -> addPasswordGetter pwds dir $ runGetSecret
-    $ mapMaybe (toCell . splitEq) $ splitBy ',' r
+type Password = IO (Maybe String)
+
+type MountpointPasswords = M.Map String Password
+
+data MountConf = MountConf
+    { passwords :: MountpointPasswords
+    , mountDir  :: FilePath
+    , rofiArgs  :: [String]
+    }
+
+instance RofiConf MountConf where
+  defArgs MountConf { rofiArgs = a } = a
+
+initMountConf :: [String] -> IO MountConf
+initMountConf a = conf <$> getEffectiveUserName
+  where
+    conf u = MountConf
+      { passwords = M.empty
+      , mountDir = "/media" </> u
+      , rofiArgs = a
+      }
+
+--------------------------------------------------------------------------------
+-- | Password-getting functions
+
+addSecret :: MountpointPasswords -> String -> MountpointPasswords
+addSecret pwds c = case splitPrefix c of
+  (dir, ":", r) -> M.insert dir (runSecret $ fromCommaSepString' r) pwds
   _             -> pwds
   where
     splitPrefix s = s =~ (":" :: String) :: (String, String, String)
-    splitEq e = e =~ ("=" :: String) :: (String, String, String)
-    toCell (k, "=", v) = Just (k, v)
-    toCell _           = Nothing
 
-runGetSecret :: [(String, String)] -> Password
-runGetSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
+runSecret :: [(String, String)] -> Password
+runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
     kvs' = concatMap (\(k, v) -> [k, v]) kvs
 
-addGetPrompt :: DevicePasswords -> String -> DevicePasswords
-addGetPrompt pwds dir = addPasswordGetter pwds dir readPassword
+addPwdPrompt :: MountpointPasswords -> String -> MountpointPasswords
+addPwdPrompt pwds dir = M.insert dir readPassword pwds
 
-addPasswordGetter :: DevicePasswords -> String -> IO (Maybe String) -> DevicePasswords
-addPasswordGetter pwds key f = M.insert key f pwds
-
--- runGetBwPwd :: [(String, String)] -> IO (Maybe String)
--- runGetBwPwd = undefined
-
--- getPassword :: Credentials -> IO (Maybe String)
--- getPassword NoCredentials = return Nothing
--- getPassword (Secret kvs) = do
---   let kvs' = concat [[a, b] | (a, b) <- M.toList kvs]
---   readCmdSuccess "secret-tool" ("lookup":kvs') ""
-
--- TODO
-check :: IO ()
-check = return ()
+--------------------------------------------------------------------------------
+-- | Main prompt
+--
+-- This command will have one Rofi prompt and will display all available
+-- mounts grouped by device type (eg removable, sshfs, cifs, etc). I like
+-- pretty things, so ensure the entries are aligned properly as well
 
 runMounts :: MountConf -> IO ()
 runMounts c = runRofiIO c $ runPrompt =<< getGroups
@@ -153,64 +160,16 @@ alignEntries :: RofiActions c -> RofiActions c
 alignEntries = O.fromList . withKeys . O.assocs
   where
     withKeys as = let (ks, vs) = unzip as in zip (align ks) vs
-    align ks = fmap (intercalate alignSep)
-      $ transpose
-      $ mapToLast pad
-      $ transpose
-      $ fmap (splitOn alignSepPre) ks
+    align = fmap (intercalate alignSep)
+      . transpose
+      . mapToLast pad
+      . transpose
+      . fmap (splitOn alignSepPre)
     pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
     getMax = maximum . fmap length
     mapToLast _ []     = []
     mapToLast _ [x]    = [x]
     mapToLast f (x:xs) = f x : mapToLast f xs
-
--- | Class and methods for type representing mountable devices
-class Mountable a where
-  -- | Mount the given type (or dismount if False is passed)
-  mount :: a -> Bool -> RofiIO MountConf ()
-
-  -- | Check if the mounting utilities are present
-  allInstalled :: a -> RofiIO MountConf Bool
-
-  -- | Return a string to go in the Rofi menu for the given type
-  fmtEntry :: a -> String
-
-  -- | Determine if the given type is mounted or not
-  isMounted :: a -> RofiIO MountConf Bool
-
-  -- | Given a mountable type, return a rofi action (string to go in the
-  -- Rofi prompt and an action to perform when it is selected)
-  mkAction :: a -> RofiIO MountConf (String, RofiIO MountConf ())
-  mkAction dev = do
-    m <- isMounted dev
-    i <- allInstalled dev
-    let a = when i $ mount dev m
-    let s = mountedPrefix m i ++ fmtEntry dev
-    return (s, a)
-    where
-      mountedPrefix False True = "  "
-      mountedPrefix True True  = "* "
-      mountedPrefix _ False    = "! "
-
--- | Key/val pairs to represent mount options. A Nothing for the value signifies
--- a standalone option (eg 'rw' and 'ro')
-type MountOptions = M.Map String (Maybe String)
-
--- | Given a string of comma-separated 'key=val' pairs, return a mount options
--- map
-parseMountOptions :: String -> MountOptions
-parseMountOptions s = M.fromList $ toCell . splitEq <$> splitBy ',' s
-  where
-    splitEq e = e =~ ("=" :: String) :: (String, String, String)
-    toCell (k, "=", v) = (k, Just v)
-    toCell (k, _, _)   = (k, Nothing)
-
--- -- | Given a mount options map, return a string of comma separated items
--- fmtMountOptions :: MountOptions -> String
--- fmtMountOptions = intercalate "," . fmap fromCell . M.toList
---   where
---     fromCell (k, Just v)  = k ++ "=" ++ v
---     fromCell (k, Nothing) = k
 
 --------------------------------------------------------------------------------
 -- | Removable devices
@@ -225,21 +184,15 @@ data Removable = Removable
     deriving (Eq, Show)
 
 instance Mountable Removable where
-  -- | (Un)mount the device using udiskctl
-  mount Removable { deviceSpec = d, label = l } m = io $ do
-    res <- readCmdEither "udisksctl" [cmd, "-b", d] ""
-    notifyMounted (isRight res) m l
-      where
-        cmd = if m then "unmount" else "mount"
+  mount Removable { deviceSpec = d, label = l } m =
+    io $ runMountNotify "mount" [c, "-b", d] l m
+    where
+      c = if m then "unmount" else "mount"
 
-  -- | Need udisksctl to mount and umount
   allInstalled _ = fmap isJust $ io $ findExecutable "udisksctl"
 
-  -- | Check if the device is mounted using /proc/mount
   isMounted Removable { deviceSpec = d } = elem d <$> io curDeviceSpecs
 
-  -- | Format the Rofi entry like 'LABEL - PATH' and add a star in the front
-  -- if the device is mounted
   fmtEntry Removable { deviceSpec = d, label = l } = l ++ alignSepPre ++ d
 
 -- | Return list of possible rofi actions for removable devices
@@ -248,9 +201,7 @@ instance Mountable Removable where
 -- label shown on the prompt will be 'SIZE Volume' where size is the size of
 -- the device
 getRemovableDevices :: RofiConf c => RofiIO c [Removable]
-getRemovableDevices = mapMaybe toDev
-  . lines
-  . stripWS
+getRemovableDevices = fromLines toDev . lines
   <$> io (readProcess "lsblk" ["-n", "-r", "-o", columns] "")
   where
     columns = "FSTYPE,HOTPLUG,PATH,LABEL,SIZE"
@@ -266,7 +217,7 @@ getRemovableDevices = mapMaybe toDev
 -- | CIFS Devices
 --
 -- This wraps the Removable device (since it is removable) and also adds its
--- own mount options and credentials for authentication.
+-- own mount options and passwords for authentication.
 
 data CIFS = CIFS Removable FilePath (Maybe Password)
 
@@ -302,7 +253,7 @@ fstabToCIFS FSTabEntry{ fstabSpec = s, fstabDir = d, fstabOptions = o } = do
   -- the cifs mount call will prompt for a password and hang otherwise.
   pwd <- if M.member "guest" o
          then return Nothing
-         else Just . M.findWithDefault readPassword d <$> asks credentials
+         else Just . M.findWithDefault readPassword d <$> asks passwords
   let r = Removable { deviceSpec = smartSlashPrefix s, label = takeFileName d }
   return $ CIFS r d pwd
   where
@@ -323,9 +274,7 @@ instance Mountable SSHFS where
     bracketOnError_
       (mkDirMaybe m)
       (rmDirMaybe m)
-      $ io $ do
-      res <- readCmdEither "mount" [m] ""
-      notifyMounted (isRight res) False l
+      (io $ runMountNotify "mount" [m] l False)
 
   mount (SSHFS Removable{ label = l } m) True = umountNotify l m
 
@@ -342,6 +291,11 @@ fstabToSSHFS FSTabEntry{ fstabSpec = s, fstabDir = d } = return $ SSHFS r d
 
 --------------------------------------------------------------------------------
 -- | MTP devices
+--
+-- These devices are a bit special because they are not based on Removable
+-- devices (eg they don't have a label and a device spec). Instead they
+-- are defined by a bus:device path. The program used for this is jmtpfs
+-- (which seems to be the fastest and most robust)
 
 data MTPFS = MTPFS
     { bus         :: String
@@ -358,9 +312,7 @@ instance Mountable MTPFS where
     bracketOnError_
       (mkDirMaybe mountpoint)
       (rmDirMaybe mountpoint)
-      $ io $ do
-      res <- readCmdEither "jmtpfs" [dev, mountpoint] ""
-      notifyMounted (isRight res) False description
+      (io $ runMountNotify "jmtpfs" [dev, mountpoint] description False)
 
   mount MTPFS { mountpoint = m, description = d } True = umountNotify d m
 
@@ -371,11 +323,12 @@ instance Mountable MTPFS where
 
   fmtEntry MTPFS { description = d } = d
 
+-- | Return list of all available MTP devices
 getMTPDevices :: RofiIO MountConf [MTPFS]
 getMTPDevices = do
   dir <- asks mountDir
   res <- io $ readProcess "jmtpfs" ["-l"] ""
-  return $ mapMaybe (toDev dir) $ toDevList res
+  return $ fromLines (toDev dir) $ toDevList res
   where
     toDevList = reverse
       . takeWhile (not . isPrefixOf "Available devices")
@@ -396,15 +349,55 @@ getMTPDevices = do
       | c == ' ' = Just '-'
       | otherwise = Just c
 
--- TODO add truecrypt volumes (see tcplay, will need root)
+--------------------------------------------------------------------------------
+-- | Mountable typeclass
+--
+-- Let this class represent anything that can be mounted. The end goal is to
+-- create a Rofi action which will define an entry in the rofi prompt for the
+-- device at hand. In order to make an action, we need functions to mount the
+-- device, check if the necessary mounting program(s) is installed, make the
+-- entry to go in the prompt, and test if the device is mounted.
+
+class Mountable a where
+  -- | Mount the given type (or dismount if False is passed)
+  mount :: a -> Bool -> RofiIO MountConf ()
+
+  -- | Check if the mounting utilities are present
+  allInstalled :: a -> RofiIO MountConf Bool
+
+  -- | Return a string to go in the Rofi menu for the given type
+  fmtEntry :: a -> String
+
+  -- | Determine if the given type is mounted or not
+  isMounted :: a -> RofiIO MountConf Bool
+
+  -- | Given a mountable type, return a rofi action (string to go in the
+  -- Rofi prompt and an action to perform when it is selected)
+  mkAction :: a -> RofiIO MountConf (String, RofiIO MountConf ())
+  mkAction dev = do
+    m <- isMounted dev
+    i <- allInstalled dev
+    let a = when i $ mount dev m
+    let s = mountedPrefix m i ++ fmtEntry dev
+    return (s, a)
+    where
+      mountedPrefix False True = "  "
+      mountedPrefix True True  = "* "
+      mountedPrefix _ False    = "! "
+
+-- TODO add truecrypt volumes
 --------------------------------------------------------------------------------
 -- | Fstab devices
+--
+-- Functions to gather all user fstab mounts on the system
 
+-- | Intermediate structure to hold fstab devices
 data FSTab = FSTab
     { sshfsDevices :: [SSHFS]
     , cifsDevices  :: [CIFS]
     }
 
+-- | Data structure representing an fstab device (or one line in the fstab file)
 data FSTabEntry = FSTabEntry
     { fstabSpec    :: String
     , fstabDir     :: FilePath
@@ -412,30 +405,39 @@ data FSTabEntry = FSTabEntry
     , fstabOptions :: MountOptions
     }
 
+-- | Key/val pairs to represent mount options. A Nothing for the value signifies
+-- a standalone option (eg 'rw' and 'ro')
+type MountOptions = M.Map String (Maybe String)
+
+-- | Return all user fstab devices from /etc/fstab
 readFSTab :: RofiIO MountConf FSTab
 readFSTab = do
   let i = FSTab { sshfsDevices = [], cifsDevices = [] }
   fstab <- io $ readFile "/etc/fstab"
-  foldM addFstabDevice i $ mapMaybe toEntry $ lines fstab
+  foldM addFstabDevice i $ fromLines toEntry $ lines fstab
   where
-    toEntry line = case words $ stripWS line of
+    toEntry line = case words line of
       (('#':_):_)                     -> Nothing
       [spec, dir, fsType, opts, _, _] -> Just $ FSTabEntry
                                          { fstabSpec = spec
                                          , fstabDir = dir
                                          , fstabType = fsType
-                                         , fstabOptions = parseMountOptions opts
+                                         , fstabOptions = parseOptions opts
                                          }
       _                               -> Nothing
+    parseOptions = M.fromList . fromCommaSepString
 
+-- | Add entry to the fstab devices list, but only if it is a known user mount
 addFstabDevice :: FSTab -> FSTabEntry -> RofiIO MountConf FSTab
 addFstabDevice f@FSTab{..} e@FSTabEntry{..}
   | M.notMember "users" fstabOptions = return f
   | fstabType == "cifs" =
-    (\d -> f { cifsDevices = cifsDevices ++ [d] }) <$> fstabToCIFS e
+    (\d -> f { cifsDevices = append d cifsDevices }) <$> fstabToCIFS e
   | fstabType == "fuse.sshfs" =
-    (\d -> f { sshfsDevices = sshfsDevices ++ [d] }) <$> fstabToSSHFS e
+    (\d -> f { sshfsDevices = append d sshfsDevices }) <$> fstabToSSHFS e
   | otherwise = return f
+  where
+    append x xs = xs ++ [x]
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
@@ -472,18 +474,32 @@ unlessMountpoint fp f = do
   mounted <- io $ isDirMounted fp
   unless mounted f
 
-umountNotify :: String -> FilePath -> RofiIO MountConf ()
-umountNotify label dir = finally cmd $ rmDirMaybe dir
-  where
-    cmd = io $ do
-      res <- readCmdEither "umount" [dir] ""
-      notifyMounted (isRight res) True label
-
 isDirMounted :: FilePath -> IO Bool
 isDirMounted fp = elem fp <$> curMountpoints
 
+runMountNotify :: String -> [String] -> String -> Bool -> IO ()
+runMountNotify cmd args msg mounted = do
+  res <- readCmdEither cmd args ""
+  notifyMounted (isRight res) mounted msg
+
+umountNotify :: String -> FilePath -> RofiIO MountConf ()
+umountNotify msg dir = finally
+  (io $ runMountNotify "umount" [dir] msg True)
+  (rmDirMaybe dir)
+
+-- | Send a notification indicating the mount succeeded
+notifyMounted :: Bool -> Bool -> String -> IO ()
+notifyMounted succeeded mounted label = void $ spawnProcess "notify-send" [msg]
+  where
+    f = if succeeded then "Successfully %sed %s" else "Failed to %s %s"
+    m = if mounted then "unmount" else "mount" :: String
+    msg = printf f m label
+
 --------------------------------------------------------------------------------
 -- | Other functions
+
+fromLines :: (String -> Maybe a) -> [String] -> [a]
+fromLines f = mapMaybe (f . stripWS)
 
 -- TODO this exists somewhere...
 splitBy :: Char -> String -> [String]
@@ -493,9 +509,17 @@ splitBy delimiter = foldr f [[]]
     f c l@(x:xs) | c == delimiter = []:l
                  | otherwise = (c:x):xs
 
-notifyMounted :: Bool -> Bool -> String -> IO ()
-notifyMounted succeeded mounted label = void $ spawnProcess "notify-send" [msg]
+-- | Like fromCommaSepString but only return substrings with '='
+fromCommaSepString' :: String -> [(String, String)]
+fromCommaSepString' s = [(k, v) | (k, Just v) <- fromCommaSepString s]
+
+-- | Split a string of comma-separated values into an alist
+-- If the substrings have an '=' in them, the left side will become the key and
+-- the right will become the value of the cell. If there is not '=' then the
+-- entire substring will become the key and the value will be Nothing
+fromCommaSepString :: String -> [(String, Maybe String)]
+fromCommaSepString = fmap (toCell . splitEq) . splitBy ','
   where
-    f = if succeeded then "Successfully %sed %s" else "Failed to %s %s"
-    m = if mounted then "unmount" else "mount" :: String
-    msg = printf f m label
+    splitEq e = e =~ ("=" :: String) :: (String, String, String)
+    toCell (k, "=", v) = (k, Just v)
+    toCell (k, _, _)   = (k, Nothing)
