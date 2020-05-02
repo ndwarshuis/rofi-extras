@@ -489,9 +489,12 @@ umountNotify msg dir = finally
 
 -- | Send a notification indicating the mount succeeded
 notifyMounted :: Bool -> Bool -> String -> IO ()
-notifyMounted succeeded mounted label = void $ spawnProcess "notify-send" [msg]
+notifyMounted succeeded mounted label =
+  void $ spawnProcess "notify-send" ["-i", i, msg]
   where
-    f = if succeeded then "Successfully %sed %s" else "Failed to %s %s"
+    (f, i) = if succeeded
+      then ("Successfully %sed %s", "dialog-information-symbolic")
+      else ("Failed to %s %s", "dialog-error-symbolic")
     m = if mounted then "unmount" else "mount" :: String
     msg = printf f m label
 
