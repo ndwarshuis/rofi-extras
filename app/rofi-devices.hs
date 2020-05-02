@@ -13,11 +13,13 @@ import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
 import qualified Data.Map.Ordered      as O
 import           Data.Maybe
+import           Data.Text             (unpack)
 
 import           Rofi.Command
 
 import           Text.Printf
 import           Text.Regex.TDFA
+import           Text.Wrap
 
 import           System.Console.GetOpt
 import           System.Directory
@@ -56,32 +58,32 @@ initMountConf a = conf <$> getEffectiveUserName
 
 options :: [OptDescr (MountConf -> MountConf)]
 options =
-  -- TODO clean up massive text blocks here with textwrap
   [ Option ['s'] ["secret"]
     (ReqArg (\s m -> m { credentials = addGetSecret (credentials m) s } ) "SECRET")
-    ("Use libsecret to retrieve password for DIR using ATTR/VAL pairs.\n" ++
-     "The pairs will be supplied to a 'secret-tool lookup' call.\n" ++
-     "Argument is formatted like 'DIR:ATTR1=VAL1,ATTR2=VAL2...'")
+    $ wrap "Use libsecret to retrieve password for DIR using ATTR/VAL pairs. \
+           \The pairs will be supplied to a 'secret-tool lookup' call. \
+           \ Argument is formatted like 'DIR:ATTR1=VAL1,ATTR2=VAL2...'"
   , Option ['d'] ["directory"]
     (ReqArg (\s m -> m { mountDir = s } ) "DIR")
-    ("The directory in which new mountpoints will be created. This is\n" ++
-     "assumed to be writable to the current user, and will be used for\n" ++
-     "fuse entries as well as user mounts in fstab. For the latter, it is\n" ++
-     "assumed that all user mounts contain this directory if a mountpoint\n" ++
-     "does not already exist for them. If not diven this will default to\n" ++
-     "'/media/USER'.")
+    $ wrap "The DIR in which new mountpoints will be created. This is assumed \
+           \to be writable to the current user, and will be used for fuse \
+           \entries as well as user mounts in fstab. For the latter, it is \
+           \assumed that all user mounts contain this directory if a \
+           \mountpoint does not already exist for them. If not given this will \
+           \default to '/media/USER'."
   , Option ['p'] ["password"]
     (ReqArg (\s m -> m { credentials = addGetPrompt (credentials m) s } ) "DIR")
     "Prompt for password when mounting DIR."
   ]
+  where
+    wrap = unpack . wrapText defaultWrapSettings 40
 
 parse :: [String] -> IO ()
 parse args = case getOpt Permute options args of
-  (o, n, [])   -> do
-    i <- initMountConf n
-    runMounts $ foldl (flip id) i o
-  -- TODO make this a real error
-  (_, _, errs) -> putStrLn $ concat errs ++ usageInfo "header" options
+  (o, n, [])   -> initMountConf n >>= \i -> runMounts $ foldl (flip id) i o
+  (_, _, errs) -> ioError $ userError $ concat errs ++ usageInfo h options
+  where
+    h = "Usage: rofi-dev [OPTIONS] [-- ROFI-OPTIONS]"
 
 addGetSecret :: DevicePasswords -> String -> DevicePasswords
 addGetSecret pwds c = case splitPrefix c of
@@ -292,16 +294,15 @@ instance Mountable CIFS where
 -- TODO this smells like something that should be in a typeclass
 fstabToCIFS :: FSTabEntry -> RofiIO MountConf CIFS
 fstabToCIFS FSTabEntry{ fstabSpec = s, fstabDir = d, fstabOptions = o } = do
-  -- This is a hack. If the options specify "guest" don't require a
-  -- password. Else try to find a means to get the password from the
-  -- command line options provided for the this mountpoint. If nothing is
-  -- found, create a dummy function that returns "" as the password, which
-  -- will be passed to the env variable PASSWD when mounting this cifs
-  -- directory and cause it to fail. Setting the env variable is necessary
+  -- If the options specify "guest" don't require a password. Else try to find a
+  -- means to get the password from the command line options provided for the
+  -- this mountpoint. If nothing is found, prompt for a password. In any case,
+  -- the output will be passed to env variable PASSWD when mounting this cifs
+  -- directory and cause it to fail. Setting the env variable is necessary as
   -- the cifs mount call will prompt for a password and hang otherwise.
   pwd <- if M.member "guest" o
          then return Nothing
-         else Just . M.findWithDefault (return $ Just "") d <$> asks credentials
+         else Just . M.findWithDefault readPassword d <$> asks credentials
   let r = Removable { deviceSpec = smartSlashPrefix s, label = takeFileName d }
   return $ CIFS r d pwd
   where
