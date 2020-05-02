@@ -61,7 +61,7 @@ checkExe cmd = do
 --
 -- The session ID will be valid only as long as TIMEOUT
 
-newtype BWConf = BWConf
+newtype BWServerConf = BWServerConf
     { timeout :: UnixDiffTime
     }
 
@@ -75,15 +75,15 @@ type Session = MVar (Maybe CurrentSession)
 runDaemon :: Int -> IO ()
 runDaemon t = do
   ses <- newMVar Nothing
-  let c = BWConf { timeout = UnixDiffTime (fromIntegral t) 0 }
+  let c = BWServerConf { timeout = UnixDiffTime (fromIntegral t) 0 }
   startService c ses
   forever $ threadDelay 1000000
 
 lockSession :: Session -> IO ()
 lockSession ses = void $ swapMVar ses Nothing
 
-getSession :: BWConf -> Session -> IO String
-getSession BWConf { timeout = t } ses = do
+getSession :: BWServerConf -> Session -> IO String
+getSession BWServerConf { timeout = t } ses = do
   ut <- getUnixTime
   modifyMVar ses $ \s -> case s of
     Just CurrentSession { timestamp = ts, hash = h } ->
@@ -97,11 +97,6 @@ getSession BWConf { timeout = t } ses = do
     newSession h = do
       ut <- getUnixTime
       return CurrentSession { timestamp = ut, hash = h }
-
-readPassword :: IO (Maybe String)
-readPassword = readCmdSuccess "rofi" args ""
-  where
-    args = dmenuArgs ++ ["-p", "Password", "-password"]
 
 readSession :: String -> IO (Maybe String)
 readSession pwd = readCmdSuccess "bw" ["unlock", pwd, "--raw"] ""
@@ -122,10 +117,15 @@ readSession pwd = readCmdSuccess "bw" ["unlock", pwd, "--raw"] ""
 --     - password (if applicable) -> copy to clipboard
 --     - anything else (notes and such) -> copy to clipboard
 
+newtype BWClientConf = BWClientConf [String]
+
+instance RofiConf BWClientConf where
+  defArgs (BWClientConf a) = a
+
 runClient :: [String] -> IO ()
 runClient a = do
-  let c = RofiConf { defArgs = a }
-  runRofiPrompt c $ selectAction $ emptyMenu
+  let c = BWClientConf a
+  runRofiIO c $ selectAction $ emptyMenu
     { groups = [untitledGroup $ toRofiActions ras]
     , prompt = Just "Action"
     }
@@ -134,12 +134,12 @@ runClient a = do
           , ("Lock Session", io callLockSession)
           ]
 
-browseLogins :: RofiPrompt ()
+browseLogins :: RofiConf c => RofiIO c ()
 browseLogins = do
   session <- io callGetSession
   forM_ session $ getItems >=> selectItem
 
-getItems :: String -> RofiPrompt [Item]
+getItems :: RofiConf c => String -> RofiIO c [Item]
 getItems session = do
   items <- io $ readProcess "bw" ["list", "items", "--session", session] ""
   return $ filter notEmpty $ fromMaybe [] $ decode $ fromString items
@@ -170,16 +170,16 @@ instance FromJSON Login
 
 -- TODO make menu buttons here to go back and to copy without leaving
 -- the current menu
-selectItem :: [Item] -> RofiPrompt ()
+selectItem :: RofiConf c => [Item] -> RofiIO c ()
 selectItem items = selectAction $ emptyMenu
   { groups = [untitledGroup $ itemsToRofiActions items]
   , prompt = Just "Login"
   }
 
-itemsToRofiActions :: [Item] -> RofiActions
+itemsToRofiActions :: RofiConf c => [Item] -> RofiActions c
 itemsToRofiActions = toRofiActions . fmap (\i -> (name i, selectCopy $ login i))
 
-selectCopy :: Login -> RofiPrompt ()
+selectCopy :: RofiConf c => Login -> RofiIO c ()
 selectCopy l = selectAction $ emptyMenu
   { groups = [untitledGroup $ loginToRofiActions l copy]
   , prompt = Just "Copy"
@@ -203,7 +203,7 @@ selectCopy l = selectAction $ emptyMenu
       , keyActions = loginToRofiActions l (const browseLogins)
       }
 
-loginToRofiActions :: Login -> (String -> RofiPrompt ()) -> RofiActions
+loginToRofiActions :: RofiConf c => Login -> (String -> RofiIO c ()) -> RofiActions c
 loginToRofiActions Login { username = u, password = p } a =
   toRofiActions $ catMaybes [user, pwd]
   where
@@ -231,7 +231,7 @@ memGetSession = "GetSession"
 memLockSession :: MemberName
 memLockSession = "LockSession"
 
-startService :: BWConf -> Session -> IO ()
+startService :: BWServerConf -> Session -> IO ()
 startService c ses = do
   client <- connectSession
   let flags = [nameAllowReplacement, nameReplaceExisting]
