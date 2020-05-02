@@ -2,6 +2,19 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections     #-}
 
+--------------------------------------------------------------------------------
+-- | rofi-bw - a rofi prompt for a bitwarden vault
+--
+-- This is basically a wrapper around the 'bw' command, which is assumed to be
+-- properly configured before running this command. This shows a system of
+-- menus that allows easy lookup of data associated with a vault entry. For now
+-- only lookups (no edits or creation) are supported, and only logins can be
+-- searched. Any searched entry can be copied to the clipboard
+--
+-- In order to manage the session keys, this utility is split into a daemon and
+-- client (the former holds the session keys between calls with the latter).
+-- They communicate via dbus.
+
 module Main (main) where
 
 import           Control.Concurrent
