@@ -97,24 +97,42 @@ runDaemon t = do
 lockSession :: Session -> IO ()
 lockSession ses = void $ swapMVar ses Nothing
 
-getSession :: BWServerConf -> Session -> IO String
-getSession BWServerConf { timeout = t } ses = do
+syncSession :: BWServerConf -> Session -> IO ()
+syncSession conf ses = notify =<< fmap join . mapM cmd =<< getSession' conf ses
+  where
+    cmd h = readCmdSuccess "bw" ["sync", "--session", h] ""
+    notify res = let j = isJust res
+      in notifyStatus j $ if j then "sync succeeded" else "sync failed"
+
+getSession' :: BWServerConf -> Session -> IO (Maybe String)
+getSession' BWServerConf { timeout = t } ses = do
   ut <- getUnixTime
   modifyMVar ses $ \s -> case s of
     Just CurrentSession { timestamp = ts, hash = h } ->
-      if diffUnixTime ut ts > t then getNewSession else return (s, h)
+      if diffUnixTime ut ts > t then getNewSession else return (s, Just h)
     Nothing -> getNewSession
   where
     getNewSession = do
       pwd <- readPassword
       newHash <- join <$> mapM readSession pwd
-      (, fromMaybe "" newHash) <$> mapM newSession newHash
+      (, newHash) <$> mapM newSession newHash
     newSession h = do
       ut <- getUnixTime
       return CurrentSession { timestamp = ut, hash = h }
 
+getSession :: BWServerConf -> Session -> IO String
+getSession conf ses = fromMaybe "" <$> getSession' conf ses
+
 readSession :: String -> IO (Maybe String)
 readSession pwd = readCmdSuccess "bw" ["unlock", pwd, "--raw"] ""
+
+notifyStatus :: Bool -> String -> IO ()
+notifyStatus succeeded msg =
+  void $ spawnProcess "notify-send" ["-i", i, msg]
+  where
+    i = if succeeded
+      then "dialog-information-symbolic"
+      else "dialog-error-symbolic"
 
 --------------------------------------------------------------------------------
 -- | Client
@@ -146,6 +164,7 @@ runClient a = do
     }
   where
     ras = [ ("Browse Logins", browseLogins)
+          , ("Sync Session", io callSyncSession)
           , ("Lock Session", io callLockSession)
           ]
 
@@ -246,6 +265,9 @@ memGetSession = "GetSession"
 memLockSession :: MemberName
 memLockSession = "LockSession"
 
+memSyncSession :: MemberName
+memSyncSession = "SyncSession"
+
 startService :: BWServerConf -> Session -> IO ()
 startService c ses = do
   client <- connectSession
@@ -257,27 +279,30 @@ startService c ses = do
     , interfaceMethods =
       [ autoMethod memGetSession $ getSession c ses
       , autoMethod memLockSession $ lockSession ses
+      , autoMethod memSyncSession $ syncSession c ses
       ]
     }
 
-callLockSession :: IO ()
-callLockSession = do
-  reply <- callMethod $ methodCall path interface memLockSession
+callMember :: MemberName -> IO [Variant]
+callMember m = do
+  reply <- callMethod $ methodCall path interface m
   case reply of
-    Left err -> putStrLn $ methodErrorMessage err
-    Right _  -> return ()
+    Left err   -> putStrLn (methodErrorMessage err) >> return []
+    Right body -> return body
+
+callLockSession :: IO ()
+callLockSession = void $ callMember memLockSession
+
+callSyncSession :: IO ()
+callSyncSession = void $ callMember memSyncSession
 
 callGetSession :: IO (Maybe String)
-callGetSession = do
-  reply <- callMethod $ methodCall path interface memGetSession
-  case reply of
-    Left err   -> putStrLn (methodErrorMessage err) >> return Nothing
-    Right body -> return $ getBodySession body
+callGetSession = getBodySession <$> callMember memGetSession
 
 getBodySession :: [Variant] -> Maybe String
-getBodySession [b] = case ses of { Just "" -> Nothing; _ -> ses }
-  where
-    ses = fromVariant b :: Maybe String
+getBodySession [b] = case fromVariant b :: Maybe String of
+  Just "" -> Nothing
+  s       -> s
 getBodySession _ = Nothing
 
 callMethod :: MethodCall -> IO (Either MethodError [Variant])
