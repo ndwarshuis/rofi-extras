@@ -59,7 +59,7 @@ Select a device to mount/unmount it. Asterisks indicate that the device is
 mounted and that selecting it will unmount it. Removable devices will be mounted
 at the default for `usdisksctl` (usually `/run/media/USER`) and everything else
 will be mounted in `/media/USER` unless the `-d` option is specified (see
-`rofi-dev -h`). In either case the directory should be owned by the user.
+`rofi-dev -h`). In the latter case the directory should be owned by the user.
 
 Fstab entries should specify the `users` mount option (not `user`) to enable
 non-root users to mount and unmount. The mountpoint should either be in
