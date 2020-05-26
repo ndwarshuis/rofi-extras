@@ -53,6 +53,8 @@ Launch the device manager:
 rofi-dev
 ```
 
+Any options after `--` will be passed to rofi.
+
 Select a device to mount/unmount it. Asterisks indicate that the device is
 mounted and that selecting it will unmount it. Removable devices will be mounted
 at the default for `usdisksctl` (usually `/run/media/USER`) and everything else
@@ -63,9 +65,30 @@ Fstab entries should specify the `users` mount option (not `user`) to enable
 non-root users to mount and unmount. The mountpoint should either be in
 `/media/USER` (or whatever is specified by `-d`) or already exist.
 
+### Credentials
+
+For fstab entries, `rofi-dev` will attempt to obtain a password if no options
+are supplied in the mount options (eg keyfiles for sshfs or credential files for
+cifs).
+
+To specifify that `/media/USER/foo` should use `secret-tool` to find its
+password, specify the `-s` option. This would lookup a password for the entry
+whose `username` is `bar` and `hostname` is `example.com`:
+
+``` sh
+rofi-dev -s '/media/USER/foo:username=bar,hostname=example.com'
+```
+
+To simply prompt for a password, use the `-p` option:
+
+``` sh
+rofi-dev -p '/media/USER/foo'
+```
+
 ### Dependencies
 - udisks2: removable drive mounting
 - sshfs: mounting network devices in fstab over ssh
 - cifs-utils: mounting network devices in fstab using CIFS/Samba
 - [jmtpfs](https://github.com/JasonFerrara/jmtpfs): mounting MTP devices
 - libnotify: desktop notifications
+- libsecret: password lookup with `secret-tool`
