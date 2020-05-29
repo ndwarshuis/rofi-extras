@@ -124,7 +124,7 @@ menuActions :: RofiMenu c -> RofiActions c
 menuActions = foldr1 (M.<>|) . fmap actions . groups
 
 menuEntries :: RofiMenu c -> String
-menuEntries = intercalate "\n\n" . fmap groupEntries . groups
+menuEntries = intercalate "\n\n" . filter (not . null) . fmap groupEntries . groups
 
 selectAction :: RofiConf c => RofiMenu c -> RofiIO c ()
 selectAction rm = do
