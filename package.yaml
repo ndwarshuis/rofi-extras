@@ -38,6 +38,7 @@ dependencies:
 - unliftio-core >= 0.1.2.0
 - word-wrap >= 0.4.1
 - text >= 1.2.3.1
+- X11 >= 1.9.1
 
 library:
   source-dirs: lib/
@@ -60,6 +61,15 @@ executables:
     - rofi-extras
   rofi-dev:
     main: rofi-dev.hs
+    source-dirs: app
+    ghc-options:
+    - -Wall
+    - -Werror
+    - -threaded
+    dependencies:
+    - rofi-extras
+  current-output:
+    main: current-output.hs
     source-dirs: app
     ghc-options:
     - -Wall
