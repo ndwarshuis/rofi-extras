@@ -50,6 +50,15 @@ library:
   - Rofi.Command
 
 executables:
+  rofi-autorandr:
+    main: rofi-autorandr.hs
+    source-dirs: app
+    ghc-options:
+    - -Wall
+    - -Werror
+    - -threaded
+    dependencies:
+    - rofi-extras
   rofi-bw:
     main: rofi-bw.hs
     source-dirs: app
