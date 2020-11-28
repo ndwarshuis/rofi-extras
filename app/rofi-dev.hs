@@ -299,6 +299,8 @@ data VeraCrypt = VeraCrypt Removable FilePath (Maybe Password)
 
 instance Mountable VeraCrypt where
   -- TODO this is just like the CIFS version...
+  -- TODO replace the veracrypt binaries with actual vercrypt program
+  -- (the setuid plan failed)
   mount (VeraCrypt Removable{ label = l } m getPwd) False =
     bracketOnError_
       (mkDirMaybe m)
@@ -306,10 +308,10 @@ instance Mountable VeraCrypt where
       $ io $ do
       res <- case getPwd of
         Just pwd -> do
+          rootpass <- maybe "" (++ "\n") <$> readPassword' "Sudo Password"
           p <- maybe [] (\p -> [("PASSWD", p)]) <$> pwd
-          readCmdEither' "mount" [m] "" p
+          readCmdEither' "sudo" (["-S", "-E", "/usr/bin/mount"] ++ [m]) rootpass p
         Nothing -> readCmdEither "mount" [m] ""
-      print res
       notifyMounted (isRight res) False l
 
   mount (VeraCrypt Removable{ label = l } m _) True =

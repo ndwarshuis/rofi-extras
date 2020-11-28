@@ -17,6 +17,7 @@ module Rofi.Command
   , titledGroup
   , selectAction
   , readPassword
+  , readPassword'
   , readCmdSuccess
   , readCmdEither
   , readCmdEither'
@@ -183,6 +184,9 @@ joinNewline :: [String] -> String
 joinNewline = intercalate "\n"
 
 readPassword :: IO (Maybe String)
-readPassword = readCmdSuccess "rofi" args ""
+readPassword = readPassword' "Password"
+
+readPassword' :: String -> IO (Maybe String)
+readPassword' p = readCmdSuccess "rofi" args ""
   where
-    args = dmenuArgs ++ ["-p", "Password", "-password"]
+    args = dmenuArgs ++ ["-p", p, "-password"]
