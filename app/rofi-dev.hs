@@ -62,7 +62,7 @@ options =
            \entries as well as user mounts in fstab. For the latter, it is \
            \assumed that all user mounts contain this directory if a \
            \mountpoint does not already exist for them. If not given this will \
-           \default to '/media/USER'."
+           \default to '/tmp/media/USER'."
   , Option ['p'] ["password"]
     (ReqArg (\s m -> m { passwords = addPwdPrompt (passwords m) s } ) "DIR")
     "Prompt for password when mounting DIR."
@@ -77,7 +77,7 @@ options =
 -- - a map between mountpoints and a means to get passwords when mounting those
 --   mountpoints
 -- - a mount directory where mountpoints will be created if needed (defaults
---   to '/media/USER'
+--   to '/tmp/media/USER'
 -- - any arguments to be passed to the rofi command
 
 type Password = IO (Maybe String)
@@ -99,7 +99,7 @@ initMountConf a = conf <$> getEffectiveUserName
   where
     conf u = MountConf
       { passwords = M.empty
-      , mountDir = "/media" </> u
+      , mountDir = "/tmp/media" </> u
       , rofiArgs = a
       }
 
@@ -486,7 +486,7 @@ addFstabDevice f@FSTab{..} e@FSTabEntry{..}
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
 
--- ASSUME these will never fail because the format of this file is fixed
+-- ASSUME these will never fail because the format of /proc/mounts is fixed
 
 curMountField :: Int -> IO [String]
 curMountField i = fmap ((!! i) . words) . lines <$> readFile "/proc/mounts"
@@ -496,6 +496,13 @@ curDeviceSpecs = curMountField 0
 
 curMountpoints :: IO [String]
 curMountpoints = curMountField 1
+
+-- ASSUME the base mount path will always be created because
+-- 'createDirectoryIfMissing' will make parents if missing, and that removing
+-- all the directories will leave the base mount path intact regardless of if it
+-- was present before doing anything (which matters here since I'm putting the
+-- base path in /tmp, so all this is saying is that umounting everything will
+-- leave /tmp/media/USER without removing all the way down to /tmp)
 
 mkDirMaybe :: FilePath -> RofiIO MountConf ()
 mkDirMaybe fp = whenInMountDir fp $ io $ createDirectoryIfMissing True fp
