@@ -171,9 +171,10 @@ runClient a = do
 browseLogins :: RofiConf c => RofiIO c ()
 browseLogins = do
   session <- io callGetSession
-  forM_ session $ getItems >=> selectItem
+  forM_ session $ (io . getItems) >=> selectItem
 
-getItems :: RofiConf c => String -> RofiIO c [Item]
+-- TODO use this in rofi-dev to mount thing using BW passwords
+getItems :: String -> IO [Item]
 getItems session = do
   items <- io $ readProcess "bw" ["list", "items", "--session", session] ""
   return $ filter notEmpty $ fromMaybe [] $ decode $ fromString items
