@@ -61,6 +61,9 @@ options =
     $ wrap "Use the Bitwarden CLI to retrieve a password for DIR. \
            \The argument is formatted like 'DIR:NAME' where NAME is the \
            \name of the Bitwarden entry to find."
+  , Option ['p'] ["password"]
+    (ReqArg (\s m -> m { passwords = addPwdPrompt (passwords m) s } ) "DIR")
+    "Prompt for password when mounting DIR."
   , Option ['d'] ["directory"]
     (ReqArg (\s m -> m { mountDir = s } ) "DIR")
     $ wrap "The DIR in which new mountpoints will be created. This is assumed \
@@ -69,9 +72,11 @@ options =
            \assumed that all user mounts contain this directory if a \
            \mountpoint does not already exist for them. If not given this will \
            \default to '/tmp/media/USER'."
-  , Option ['p'] ["password"]
-    (ReqArg (\s m -> m { passwords = addPwdPrompt (passwords m) s } ) "DIR")
-    "Prompt for password when mounting DIR."
+  , Option ['v'] ["veracrypt"]
+    (ReqArg (\s m -> m { vcMounts = addVeracryptMount (vcMounts m) s } ) "VC")
+    $ wrap "A veracrypt mount specification formatted like DIR:VOL where \
+           \DIR is the mountpoint and VOL is the path to the encrypted \
+           \volume. To specify a password, use the -p, -b- or -s options."
   ]
   where
     wrap = unpack . wrapText defaultWrapSettings 40
@@ -90,11 +95,19 @@ type Password = IO (Maybe String)
 
 type MountpointPasswords = M.Map String Password
 
+type VeracryptMount = (FilePath, FilePath)
+
+addVeracryptMount :: [VeracryptMount] -> String -> [VeracryptMount]
+addVeracryptMount l s = case splitPrefix s of
+  (dir, ":", vol) -> (dir, vol):l
+  _               -> l
+
 -- TODO check if mountdir exists or puke
 data MountConf = MountConf
     { passwords :: MountpointPasswords
     , mountDir  :: FilePath
     , rofiArgs  :: [String]
+    , vcMounts  :: [VeracryptMount]
     }
 
 instance RofiConf MountConf where
@@ -107,6 +120,7 @@ initMountConf a = conf <$> getEffectiveUserName
       { passwords = M.empty
       , mountDir = "/tmp/media" </> u
       , rofiArgs = a
+      , vcMounts = []
       }
 
 --------------------------------------------------------------------------------
@@ -159,7 +173,7 @@ getGroups = do
   sequence
     [ mkGroup "SSHFS Devices" $ sshfsDevices fstab
     , mkGroup "CIFS Devices" $ cifsDevices fstab
-    , mkGroup "Veracrypt Devices" $ veracryptDevices fstab
+    , mkGroup "Veracrypt Devices" =<< getVeracryptDevices
     , mkGroup "Removable Devices" =<< getRemovableDevices
     , mkGroup "MTP Devices" =<< getMTPDevices
     ]
@@ -314,37 +328,39 @@ fstabToSSHFS FSTabEntry{ fstabSpec = s, fstabDir = d } = return $ SSHFS r d
 data VeraCrypt = VeraCrypt Removable FilePath (Maybe Password)
 
 instance Mountable VeraCrypt where
-  -- TODO this is just like the CIFS version...
-  -- TODO replace the veracrypt binaries with actual vercrypt program
-  -- (the setuid plan failed)
-  mount (VeraCrypt Removable{ label = l } m getPwd) False =
+  mount (VeraCrypt Removable{ deviceSpec = s, label = l } m getPwd) False =
     bracketOnError_
       (mkDirMaybe m)
       (rmDirMaybe m)
-      $ io $ do
-      res <- case getPwd of
-        Just pwd -> do
-          rootpass <- maybe "" (++ "\n") <$> readPassword' "Sudo Password"
-          p <- maybe [] (\p -> [("PASSWD", p)]) <$> pwd
-          readCmdEither' "sudo" (["-S", "-E", "/usr/bin/mount"] ++ [m]) rootpass p
-        Nothing -> readCmdEither "mount" [m] ""
-      notifyMounted (isRight res) False l
+      $ io $ (\res -> notifyMounted (isRight res) False l)
+      =<< runVeraCrypt
+      =<< ([s, m] ++) . maybe [] (\p -> ["-p", p]) . join
+      <$> sequence getPwd
 
-  mount (VeraCrypt Removable{ label = l } m _) True =
-    umountNotify' "umount.veracrypt" l m
+  mount (VeraCrypt Removable{ label = l } m _) True = io $ do
+    res <- runVeraCrypt ["-d", m]
+    notifyMounted (isRight res) True l
 
-  -- TODO also check for umount.veracrypt?
-  allInstalled _ = io $ isJust <$> findExecutable "mount.veracrypt"
+  allInstalled _ = io $ isJust <$> findExecutable "veracrypt"
 
   isMounted (VeraCrypt _ dir _) = io $ isDirMounted dir
 
   fmtEntry (VeraCrypt r _ _) = fmtEntry r
 
-fstabToVeraCrypt :: FSTabEntry -> RofiIO MountConf VeraCrypt
-fstabToVeraCrypt FSTabEntry{ fstabSpec = s, fstabDir = d } = do
-  pwd <- Just . M.findWithDefault readPassword d <$> asks passwords
-  let r = Removable { deviceSpec = s, label = takeFileName d }
-  return $ VeraCrypt r d pwd
+runVeraCrypt :: [String] -> IO (Either (Int, String, String) String)
+runVeraCrypt args = do
+  rootpass <- maybe "" (++ "\n") <$> readPassword' "Sudo Password"
+  readCmdEither "sudo" (defaultArgs ++ args) rootpass
+  where
+    defaultArgs = ["-S", "-E", "/usr/bin/veracrypt", "--text", "--non-interactive"]
+
+getVeracryptDevices :: RofiIO MountConf [VeraCrypt]
+getVeracryptDevices = mapM toDev =<< asks vcMounts
+  where
+    toDev (d, s) = do
+      pwd <- Just . M.findWithDefault readPassword d <$> asks passwords
+      let r = Removable { deviceSpec = s, label = takeFileName d }
+      return $ VeraCrypt r d pwd
 
 --------------------------------------------------------------------------------
 -- | MTP devices
@@ -450,9 +466,9 @@ class Mountable a where
 
 -- | Intermediate structure to hold fstab devices
 data FSTab = FSTab
-    { sshfsDevices     :: [SSHFS]
-    , cifsDevices      :: [CIFS]
-    , veracryptDevices :: [VeraCrypt]
+    { sshfsDevices :: [SSHFS]
+    , cifsDevices  :: [CIFS]
+    -- , veracryptDevices :: [VeraCrypt]
     }
 
 -- | Data structure representing an fstab device (or one line in the fstab file)
@@ -470,7 +486,8 @@ type MountOptions = M.Map String (Maybe String)
 -- | Return all user fstab devices from /etc/fstab
 readFSTab :: RofiIO MountConf FSTab
 readFSTab = do
-  let i = FSTab { sshfsDevices = [], cifsDevices = [], veracryptDevices = []}
+  -- let i = FSTab { sshfsDevices = [], cifsDevices = [], veracryptDevices = []}
+  let i = FSTab { sshfsDevices = [], cifsDevices = []}
   fstab <- io $ readFile "/etc/fstab"
   foldM addFstabDevice i $ fromLines toEntry $ lines fstab
   where
@@ -493,8 +510,8 @@ addFstabDevice f@FSTab{..} e@FSTabEntry{..}
     (\d -> f { cifsDevices = append d cifsDevices }) <$> fstabToCIFS e
   | fstabType == "fuse.sshfs" =
     (\d -> f { sshfsDevices = append d sshfsDevices }) <$> fstabToSSHFS e
-  | fstabType == "veracrypt" =
-    (\d -> f { veracryptDevices = append d veracryptDevices }) <$> fstabToVeraCrypt e
+  -- | fstabType == "veracrypt" =
+  --   (\d -> f { veracryptDevices = append d veracryptDevices }) <$> fstabToVeraCrypt e
   | otherwise = return f
   where
     append x xs = xs ++ [x]
