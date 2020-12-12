@@ -47,6 +47,7 @@ library:
   - -Werror
   - -threaded
   exposed-modules:
+  - Bitwarden.Internal
   - Rofi.Command
 
 executables:
