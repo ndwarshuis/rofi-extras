@@ -11,6 +11,8 @@
 
 module Main (main) where
 
+import           Bitwarden.Internal
+
 import           Control.Monad
 import           Control.Monad.Reader
 
@@ -47,7 +49,6 @@ parse args = case getOpt Permute options args of
   where
     h = "Usage: rofi-dev [OPTIONS] [-- ROFI-OPTIONS]"
 
--- TODO add option to look up password in bitwarden vault
 options :: [OptDescr (MountConf -> MountConf)]
 options =
   [ Option ['s'] ["secret"]
@@ -55,6 +56,11 @@ options =
     $ wrap "Use libsecret to retrieve password for DIR using ATTR/VAL pairs. \
            \The pairs will be supplied to a 'secret-tool lookup' call. \
            \ Argument is formatted like 'DIR:ATTR1=VAL1,ATTR2=VAL2...'"
+  , Option ['b'] ["bitwarden"]
+    (ReqArg (\s m -> m { passwords = addBitwarden (passwords m) s } ) "BW")
+    $ wrap "Use the Bitwarden CLI to retrieve a password for DIR. \
+           \The argument is formatted like 'DIR:NAME' where NAME is the \
+           \name of the Bitwarden entry to find."
   , Option ['d'] ["directory"]
     (ReqArg (\s m -> m { mountDir = s } ) "DIR")
     $ wrap "The DIR in which new mountpoints will be created. This is assumed \
@@ -110,16 +116,26 @@ addSecret :: MountpointPasswords -> String -> MountpointPasswords
 addSecret pwds c = case splitPrefix c of
   (dir, ":", r) -> M.insert dir (runSecret $ fromCommaSepString' r) pwds
   _             -> pwds
-  where
-    splitPrefix s = s =~ (":" :: String) :: (String, String, String)
 
 runSecret :: [(String, String)] -> Password
 runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
     kvs' = concatMap (\(k, v) -> [k, v]) kvs
 
+addBitwarden :: MountpointPasswords -> String -> MountpointPasswords
+addBitwarden pwds c = case splitPrefix c of
+  (dir, ":", name) -> M.insert dir (runBitwarden name) pwds
+  _                -> pwds
+
+runBitwarden :: String -> Password
+runBitwarden pname = ((password . login) <=< find (\i -> name i == pname))
+  <$> getItems
+
 addPwdPrompt :: MountpointPasswords -> String -> MountpointPasswords
 addPwdPrompt pwds dir = M.insert dir readPassword pwds
+
+splitPrefix :: String -> (String, String, String)
+splitPrefix s = s =~ (":" :: String)
 
 --------------------------------------------------------------------------------
 -- | Main prompt

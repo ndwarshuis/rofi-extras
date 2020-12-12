@@ -78,7 +78,7 @@ getSession' BWServerConf { timeout = t } ses = do
     Nothing -> getNewSession
   where
     getNewSession = do
-      pwd <- readPassword
+      pwd <- readPassword' "Bitwarden Password"
       newHash <- join <$> mapM readSession pwd
       (, newHash) <$> mapM newSession newHash
     newSession h = do
@@ -134,13 +134,13 @@ runClient a = do
           ]
 
 browseLogins :: RofiConf c => RofiIO c ()
-browseLogins = do
-  session <- io callGetSession
-  forM_ session $ (io . getItems) >=> selectItem
+browseLogins = io getItems >>= selectItem
 
--- TODO use this in rofi-dev to mount thing using BW passwords
-getItems :: String -> IO [Item]
-getItems session = do
+getItems :: IO [Item]
+getItems = maybe (return []) getItems' =<< callGetSession
+
+getItems' :: String -> IO [Item]
+getItems' session = do
   items <- io $ readProcess "bw" ["list", "items", "--session", session] ""
   return $ filter notEmpty $ fromMaybe [] $ decode $ fromString items
   where
