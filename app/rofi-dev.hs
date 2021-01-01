@@ -91,9 +91,9 @@ options =
 --   to '/tmp/media/USER'
 -- - any arguments to be passed to the rofi command
 
-type Password = IO (Maybe String)
+type PasswordGetter = IO (Maybe String)
 
-type MountpointPasswords = M.Map String Password
+type MountpointPasswords = M.Map String PasswordGetter
 
 type VeracryptMount = (FilePath, FilePath)
 
@@ -131,7 +131,7 @@ addSecret pwds c = case splitPrefix c of
   (dir, ":", r) -> M.insert dir (runSecret $ fromCommaSepString' r) pwds
   _             -> pwds
 
-runSecret :: [(String, String)] -> Password
+runSecret :: [(String, String)] -> PasswordGetter
 runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
     kvs' = concatMap (\(k, v) -> [k, v]) kvs
@@ -141,7 +141,7 @@ addBitwarden pwds c = case splitPrefix c of
   (dir, ":", name) -> M.insert dir (runBitwarden name) pwds
   _                -> pwds
 
-runBitwarden :: String -> Password
+runBitwarden :: String -> PasswordGetter
 runBitwarden pname = ((password . login) <=< find (\i -> name i == pname))
   <$> getItems
 
@@ -251,7 +251,7 @@ getRemovableDevices = fromLines toDev . lines
 -- This wraps the Removable device (since it is removable) and also adds its
 -- own mount options and passwords for authentication.
 
-data CIFS = CIFS Removable FilePath (Maybe Password)
+data CIFS = CIFS Removable FilePath (Maybe PasswordGetter)
 
 instance Mountable CIFS where
   mount (CIFS Removable{ label = l } m getPwd) False =
@@ -325,17 +325,18 @@ fstabToSSHFS FSTabEntry{ fstabSpec = s, fstabDir = d } = return $ SSHFS r d
 -- | VeraCrypt Devices
 --
 
-data VeraCrypt = VeraCrypt Removable FilePath (Maybe Password)
+data VeraCrypt = VeraCrypt Removable FilePath (Maybe PasswordGetter)
 
 instance Mountable VeraCrypt where
   mount (VeraCrypt Removable{ deviceSpec = s, label = l } m getPwd) False =
-    bracketOnError_
-      (mkDirMaybe m)
-      (rmDirMaybe m)
-      $ io $ (\res -> notifyMounted (isRight res) False l)
-      =<< runVeraCrypt
-      =<< ([s, m] ++) . maybe [] (\p -> ["-p", p]) . join
-      <$> sequence getPwd
+    bracketOnError_ (mkDirMaybe m) (rmDirMaybe m) mountMaybe
+    where
+      mountMaybe = io $ maybe (runVeraCryptWith []) (runVeraCryptWithPwd =<<) getPwd
+      runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith ["-p", p])
+      runVeraCryptWith args = (\res -> notifyMounted (isRight res) False l)
+        =<< runVeraCrypt ([s, m] ++ args)
+      notifyFail = notify "dialog-error-symbolic" $
+        printf "Failed to get volume password for %s" l
 
   mount (VeraCrypt Removable{ label = l } m _) True = io $ do
     res <- runVeraCrypt ["-d", m]
@@ -576,14 +577,16 @@ umountNotify = umountNotify' "umount"
 
 -- | Send a notification indicating the mount succeeded
 notifyMounted :: Bool -> Bool -> String -> IO ()
-notifyMounted succeeded mounted label =
-  void $ spawnProcess "notify-send" ["-i", i, msg]
+notifyMounted succeeded mounted label = notify icon body
   where
-    (f, i) = if succeeded
+    (format, icon) = if succeeded
       then ("Successfully %sed %s", "dialog-information-symbolic")
       else ("Failed to %s %s", "dialog-error-symbolic")
     m = if mounted then "unmount" else "mount" :: String
-    msg = printf f m label
+    body = printf format m label
+
+notify :: String -> String -> IO ()
+notify icon body = void $ spawnProcess "notify-send" ["-i", icon, body]
 
 --------------------------------------------------------------------------------
 -- | Other functions
