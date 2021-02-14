@@ -213,6 +213,15 @@ loginToRofiActions Login { username = u, password = p } a =
     user = copyIfJust fmtUsername u
     pwd = copyIfJust fmtPassword p
 
+getItemPassword' :: BWServerConf -> Session -> String -> IO (Maybe String)
+getItemPassword' conf session item = mapM getPwd =<< getSession' conf session
+  where
+    getPwd s = readProcess "bw" ["get", "password", item, "--session", s] ""
+
+getItemPassword :: BWServerConf -> Session -> String -> IO String
+getItemPassword conf session item = fromMaybe "" <$>
+  getItemPassword' conf session item
+
 --------------------------------------------------------------------------------
 -- | DBus
 
@@ -228,6 +237,7 @@ startService c ses = do
       [ autoMethod memGetSession $ getSession c ses
       , autoMethod memLockSession $ lockSession ses
       , autoMethod memSyncSession $ syncSession c ses
+      , autoMethod memGetPassword $ getItemPassword c ses
       ]
     }
 
@@ -249,6 +259,9 @@ memLockSession = "LockSession"
 memSyncSession :: MemberName
 memSyncSession = "SyncSession"
 
+memGetPassword :: MemberName
+memGetPassword = "GetPassword"
+
 callMember :: MemberName -> IO [Variant]
 callMember m = do
   reply <- callMethod $ methodCall path interface m
@@ -263,13 +276,15 @@ callSyncSession :: IO ()
 callSyncSession = void $ callMember memSyncSession
 
 callGetSession :: IO (Maybe String)
-callGetSession = getBodySession <$> callMember memGetSession
+callGetSession = getBodyString <$> callMember memGetSession
 
-getBodySession :: [Variant] -> Maybe String
-getBodySession [b] = case fromVariant b :: Maybe String of
+-- TODO maybe will need to add a caller for getItemPassword
+
+getBodyString :: [Variant] -> Maybe String
+getBodyString [b] = case fromVariant b :: Maybe String of
   Just "" -> Nothing
   s       -> s
-getBodySession _ = Nothing
+getBodyString _ = Nothing
 
 callMethod :: MethodCall -> IO (Either MethodError [Variant])
 callMethod mc = do
