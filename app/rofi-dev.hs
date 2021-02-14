@@ -331,15 +331,15 @@ instance Mountable VeraCrypt where
   mount (VeraCrypt Removable{ deviceSpec = s, label = l } m getPwd) False =
     bracketOnError_ (mkDirMaybe m) (rmDirMaybe m) mountMaybe
     where
-      mountMaybe = io $ maybe (runVeraCryptWith []) (runVeraCryptWithPwd =<<) getPwd
-      runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith ["-p", p])
-      runVeraCryptWith args = (\res -> notifyMounted (isRight res) False l)
-        =<< runVeraCrypt ([s, m] ++ args)
+      mountMaybe = io $ maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) getPwd
+      runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
+      runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False l)
+        =<< runVeraCrypt stdin ([s, m] ++ args)
       notifyFail = notify "dialog-error-symbolic" $
         printf "Failed to get volume password for %s" l
 
   mount (VeraCrypt Removable{ label = l } m _) True = io $ do
-    res <- runVeraCrypt ["-d", m]
+    res <- runVeraCrypt "" ["-d", m]
     notifyMounted (isRight res) True l
 
   allInstalled _ = io $ isJust <$> findExecutable "veracrypt"
@@ -348,12 +348,13 @@ instance Mountable VeraCrypt where
 
   fmtEntry (VeraCrypt r _ _) = fmtEntry r
 
-runVeraCrypt :: [String] -> IO (Either (Int, String, String) String)
-runVeraCrypt args = do
-  rootpass <- maybe "" (++ "\n") <$> readPassword' "Sudo Password"
-  readCmdEither "sudo" (defaultArgs ++ args) rootpass
+-- NOTE: the user is assumed to have added themselves to the sudoers file so
+-- that this command will work
+runVeraCrypt :: String -> [String] -> IO (Either (Int, String, String) String)
+runVeraCrypt stdin args = do
+  readCmdEither "sudo" (defaultArgs ++ args) stdin
   where
-    defaultArgs = ["-S", "-E", "/usr/bin/veracrypt", "--text", "--non-interactive"]
+    defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
 
 getVeracryptDevices :: RofiIO MountConf [VeraCrypt]
 getVeracryptDevices = mapM toDev =<< asks vcMounts
