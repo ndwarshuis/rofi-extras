@@ -285,7 +285,7 @@ fstabToCIFS FSTabEntry{ fstabSpec = s, fstabDir = d, fstabOptions = o } = do
   -- the cifs mount call will prompt for a password and hang otherwise.
   pwd <- if M.member "guest" o
          then return Nothing
-         else Just . M.findWithDefault readPassword d <$> asks passwords
+         else asks $ Just . M.findWithDefault readPassword d . passwords
   let r = Removable { deviceSpec = smartSlashPrefix s, label = takeFileName d }
   return $ CIFS r d pwd
   where
@@ -360,7 +360,7 @@ getVeracryptDevices :: RofiIO MountConf [VeraCrypt]
 getVeracryptDevices = mapM toDev =<< asks vcMounts
   where
     toDev (d, s) = do
-      pwd <- Just . M.findWithDefault readPassword d <$> asks passwords
+      pwd <- asks $ Just . M.findWithDefault readPassword d . passwords
       let r = Removable { deviceSpec = s, label = takeFileName d }
       return $ VeraCrypt r d pwd
 
