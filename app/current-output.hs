@@ -35,7 +35,7 @@ main :: IO ()
 main = getMonitorName >>= maybe exitFailure (\n -> putStrLn n >> exitSuccess)
 
 data Coord = Coord Int Int
-    deriving Eq
+    deriving (Eq, Show)
 
 getMonitorName :: IO (Maybe String)
 getMonitorName = do
