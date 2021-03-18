@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiParamTypeClasses  #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
@@ -23,13 +24,14 @@ import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
 import qualified Data.Map.Ordered      as O
 import           Data.Maybe
-import           Data.Text             (unpack)
+import qualified Data.Vector as V
+import           Data.Yaml
+
+import           GHC.Generics()
 
 import           Rofi.Command
 
 import           Text.Printf
-import           Text.Regex.TDFA
-import           Text.Wrap
 
 import           System.Console.GetOpt
 import           System.Directory
@@ -53,38 +55,143 @@ parse args = case getOpt Permute options args of
 
 options :: [OptDescr (MountConf -> MountConf)]
 options =
-  [ Option ['s'] ["secret"]
-    (ReqArg (\s m -> m { passwords = addSecret (passwords m) s } ) "SECRET")
-    $ wrap "Use libsecret to retrieve password for DIR using ATTR/VAL pairs. \
-           \The pairs will be supplied to a 'secret-tool lookup' call. \
-           \ Argument is formatted like 'DIR:ATTR1=VAL1,ATTR2=VAL2...'"
-  , Option ['b'] ["bitwarden"]
-    (ReqArg (\s m -> m { passwords = addBitwarden (passwords m) s } ) "BW")
-    $ wrap "Use the Bitwarden CLI to retrieve a password for DIR. \
-           \The argument is formatted like 'DIR:NAME' where NAME is the \
-           \name of the Bitwarden entry to find."
-  , Option ['p'] ["password"]
-    (ReqArg (\s m -> m { passwords = addPwdPrompt (passwords m) s } ) "DIR")
-    "Prompt for password when mounting DIR."
-  , Option ['d'] ["directory"]
-    (ReqArg (\s m -> m { mountDir = s } ) "DIR")
-    $ wrap "The DIR in which new mountpoints will be created. This is assumed \
-           \to be writable to the current user, and will be used for fuse \
-           \entries as well as user mounts in fstab. For the latter, it is \
-           \assumed that all user mounts contain this directory if a \
-           \mountpoint does not already exist for them. If not given this will \
-           \default to '/tmp/media/USER'."
-  , Option ['v'] ["veracrypt"]
-    (ReqArg (\s m -> m { vcMounts = addVeracryptMount (vcMounts m) s } ) "VC")
-    $ wrap "A veracrypt mount specification formatted like DIR:VOL where \
-           \DIR is the mountpoint and VOL is the path to the encrypted \
-           \volume. To specify a password, use the -p, -b- or -s options."
+  [ Option ['c'] ["config"]
+    (ReqArg (\s m -> m { mConfig = Just s } ) "CONF")
+    "The path to the config file"
   ]
-  where
-    wrap = unpack . wrapText defaultWrapSettings 40
 
 --------------------------------------------------------------------------------
 -- | Static configuration
+--
+-- This is defined in a YAML file which describes how to mount each device. Here
+-- I define a parser for said YAML file
+
+defaultTries :: Integer
+defaultTries = 2
+
+data MountConfig = MountConfig
+  { _mountMountPoint :: FilePath
+  , _mountLabel :: Maybe String
+  } deriving Show
+
+instance FromJSON MountConfig where
+  parseJSON = withObject "devices" $ \o -> MountConfig
+    <$> o .: "mountpoint"
+    <*> o .:? "label"
+
+data BitwardenConfig = BitwardenConfig
+  { _bitwardenKey :: String
+  , _bitwardenTries :: Integer }
+  deriving Show
+
+instance FromJSON BitwardenConfig where
+  parseJSON = withObject "bitwarden" $ \o -> BitwardenConfig
+    <$> o .: "key"
+    <*> o .:? "tries" .!= defaultTries
+
+newtype LibSecretConfig = LibSecretConfig
+  { _libsecretAttributes :: M.Map String String }
+  deriving Show
+
+instance FromJSON LibSecretConfig where
+  parseJSON = withObject "libsecret" $ \o -> LibSecretConfig
+    <$> o .: "attributes"
+
+newtype PromptConfig = PromptConfig
+  { _promptTries :: Integer }
+  deriving Show
+
+instance FromJSON PromptConfig where
+  parseJSON = withObject "libsecret" $ \o -> PromptConfig
+    <$> o .: "tries" .!= defaultTries
+
+data PasswordConfig = PasswordConfig
+  { _passwordBitwarden :: Maybe BitwardenConfig
+  , _passwordLibSecret :: Maybe LibSecretConfig
+  , _passwordPrompt :: Maybe PromptConfig
+  }
+  deriving Show
+
+instance FromJSON PasswordConfig where
+  parseJSON = withObject "password" $ \o -> PasswordConfig
+    <$> o .:? "bitwarden"
+    <*> o .:? "libsecret"
+    <*> o .:? "prompt"
+                       
+data VeracryptConfig = VeracryptConfig
+  { _veracryptMount :: MountConfig
+  , _veracryptVolume :: String
+  , _veracryptPassword :: Maybe PasswordConfig
+  } deriving Show
+
+instance FromJSON VeracryptConfig where
+  parseJSON = withObject "veracrypt" $ \o -> VeracryptConfig
+    <$> o .: "mount"
+    <*> o .: "volume"
+    <*> o .:? "password"
+
+data SSHFSConfig = SSHFSConfig
+  { _sshfsMount :: MountConfig
+  , _sshfsRemote :: String
+  } deriving Show
+
+instance FromJSON SSHFSConfig where
+  parseJSON = withObject "sshfs" $ \o -> SSHFSConfig
+    <$> o .: "mount"
+    <*> o .: "remote"
+
+data CIFSConfig = CIFSConfig
+  { _cifsMount :: MountConfig
+  , _cifsRemote :: String
+  , _cifsPassword :: Maybe PasswordConfig
+  } deriving Show
+
+instance FromJSON CIFSConfig where
+  parseJSON = withObject "cifs" $ \o -> CIFSConfig
+    <$> o .: "mount"
+    <*> o .: "remote"
+    <*> o .: "password"
+
+data DevicesConfig = DevicesConfig
+  { _veracryptConfigs :: V.Vector VeracryptConfig
+  , _sshfsConfigs :: V.Vector SSHFSConfig
+  , _cifsConfigs :: V.Vector CIFSConfig
+  } deriving Show
+
+instance FromJSON DevicesConfig where
+  parseJSON = withObject "devices" $ \o -> DevicesConfig
+    <$> o .: "veracrypt"
+    <*> o .: "sshfs"
+    <*> o .: "cifs"
+
+data StaticConfig = StaticConfig
+  { _tmpMountDir :: Maybe String
+  , _devicesConfig :: Maybe DevicesConfig
+  } deriving Show
+
+instance FromJSON StaticConfig where
+  parseJSON = withObject "devices" $ \o -> StaticConfig
+    <$> o .:? "mountdir"
+    <*> o .:? "devices"
+
+--------------------------------------------------------------------------------
+-- | Static Devices typeclass
+--
+-- A class to represent devices defined in the static configuration (eg the YAML
+-- file). Its methods define the machinery to extract specific devies types
+-- from the parse tree.
+
+class Mountable m => StaticDevice m a where
+  -- | Mount the given type (or dismount if False is passed)
+  fromConfig :: V.Vector a -> RofiIO MountConf [m]
+  fromConfig s = do
+    v <- asks mountDir
+    return $ configToDev v <$> V.toList s
+
+  configToDev :: FilePath -> a -> m
+
+--------------------------------------------------------------------------------
+-- | Global config used in the reader monad stack
 --
 -- This is defined by the mount options on the command line, and holds:
 -- - a map between mountpoints and a means to get passwords when mounting those
@@ -93,23 +200,11 @@ options =
 --   to '/tmp/media/USER'
 -- - any arguments to be passed to the rofi command
 
-type PasswordGetter = IO (Maybe String)
-
-type MountpointPasswords = M.Map String PasswordGetter
-
-type VeracryptMount = (FilePath, FilePath)
-
-addVeracryptMount :: [VeracryptMount] -> String -> [VeracryptMount]
-addVeracryptMount l s = case splitPrefix s of
-  (dir, ":", vol) -> (dir, vol):l
-  _               -> l
-
--- TODO check if mountdir exists or puke
 data MountConf = MountConf
-    { passwords :: MountpointPasswords
-    , mountDir  :: FilePath
+    { mountDir  :: FilePath
     , rofiArgs  :: [String]
-    , vcMounts  :: [VeracryptMount]
+    , mConfig   :: Maybe FilePath
+    , devConfig :: Maybe DevicesConfig
     }
 
 instance RofiConf MountConf where
@@ -119,39 +214,52 @@ initMountConf :: [String] -> IO MountConf
 initMountConf a = conf <$> getEffectiveUserName
   where
     conf u = MountConf
-      { passwords = M.empty
-      , mountDir = "/tmp/media" </> u
+      { mountDir = "/tmp/media" </> u
       , rofiArgs = a
-      , vcMounts = []
+      , mConfig = Nothing
+      , devConfig = Nothing
       }
 
 --------------------------------------------------------------------------------
 -- | Password-getting functions
 
-addSecret :: MountpointPasswords -> String -> MountpointPasswords
-addSecret pwds c = case splitPrefix c of
-  (dir, ":", r) -> M.insert dir (runSecret $ fromCommaSepString' r) pwds
-  _             -> pwds
+type PasswordGetter = IO (Maybe String)
 
 runSecret :: [(String, String)] -> PasswordGetter
 runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
     kvs' = concatMap (\(k, v) -> [k, v]) kvs
 
-addBitwarden :: MountpointPasswords -> String -> MountpointPasswords
-addBitwarden pwds c = case splitPrefix c of
-  (dir, ":", name) -> M.insert dir (runBitwarden name) pwds
-  _                -> pwds
-
 runBitwarden :: String -> PasswordGetter
 runBitwarden pname = ((password . login) <=< find (\i -> name i == pname))
   <$> getItems
 
-addPwdPrompt :: MountpointPasswords -> String -> MountpointPasswords
-addPwdPrompt pwds dir = M.insert dir readPassword pwds
+runPromptLoop :: Integer -> PasswordGetter -> PasswordGetter
+runPromptLoop n pwd = do
+  res <- pwd
+  if isNothing res then
+    if n <= 0 then return Nothing else runPromptLoop (n-1) pwd
+    else return res
 
-splitPrefix :: String -> (String, String, String)
-splitPrefix s = s =~ (":" :: String)
+configToPwd :: PasswordConfig -> PasswordGetter
+configToPwd PasswordConfig{ _passwordBitwarden = b
+                          , _passwordLibSecret = s
+                          , _passwordPrompt = p
+                          } =
+    getBW b `runMaybe` getLS s `runMaybe` getPrompt p
+  where
+    getBW (Just BitwardenConfig{ _bitwardenKey = k, _bitwardenTries = n }) =
+      runPromptLoop n $ runBitwarden k
+    getBW _ = return Nothing
+    getLS (Just LibSecretConfig{ _libsecretAttributes = a }) =
+      runSecret $ M.toList a
+    getLS _ = return Nothing
+    getPrompt (Just PromptConfig{ _promptTries = n }) =
+      runPromptLoop n readPassword
+    getPrompt _ = return Nothing
+    runMaybe x y = do
+      res <- x
+      if isNothing res then y else return res
 
 --------------------------------------------------------------------------------
 -- | Main prompt
@@ -161,7 +269,18 @@ splitPrefix s = s =~ (":" :: String)
 -- pretty things, so ensure the entries are aligned properly as well
 
 runMounts :: MountConf -> IO ()
-runMounts c = runRofiIO c $ runPrompt =<< getGroups
+runMounts c = do
+  c' <- maybe (return c) parseConfig (mConfig c)
+  runRofiIO c' $ runPrompt =<< getGroups
+  where
+    parseConfig m = do
+      res <- decodeFileEither m
+      case res of
+        Left e -> print e >> return c
+        Right StaticConfig { _tmpMountDir = Just v, _devicesConfig = dc } ->
+          return $ c { mountDir = v, devConfig = dc }
+        Right StaticConfig { _devicesConfig = dc } ->
+          return $ c { devConfig = dc }
 
 runPrompt :: RofiConf c => [RofiGroup c] -> RofiIO c ()
 runPrompt gs = selectAction $ emptyMenu
@@ -171,12 +290,19 @@ runPrompt gs = selectAction $ emptyMenu
 
 getGroups :: RofiIO MountConf [RofiGroup MountConf]
 getGroups = do
-  fstab <- readFSTab
   sysd <- io getSystemdDevices
+  devConf <- asks devConfig
+  (cifsDevs, sshfsDevs, vcDevs) <- maybe
+    (return ( [] :: [CIFS], [] :: [SSHFS], [] :: [VeraCrypt]))
+    (\c -> liftM3 (,,)
+           (fromConfig $ _cifsConfigs c)
+           (fromConfig $ _sshfsConfigs c)
+           (fromConfig $ _veracryptConfigs c))
+    devConf
   sequence
-    [ mkGroup2 "SSHFS Devices" (filterSysd SystemdSSHFS sysd) $ sshfsDevices fstab
-    , mkGroup "CIFS Devices" $ cifsDevices fstab
-    , mkGroup2 "Veracrypt Devices" (filterSysd SystemdVeracrypt sysd) =<< getVeracryptDevices
+    [ mkGroup2 "SSHFS Devices" (filterSysd SystemdSSHFS sysd) sshfsDevs
+    , mkGroup "CIFS Devices" cifsDevs
+    , mkGroup2 "Veracrypt Devices" (filterSysd SystemdVeracrypt sysd) vcDevs
     , mkGroup "Removable Devices"  =<< getRemovableDevices
     , mkGroup "MTP Devices" =<< getMTPDevices
     ]
@@ -288,22 +414,14 @@ instance Mountable CIFS where
 
   fmtEntry (CIFS r _ _) = fmtEntry r
 
--- TODO this smells like something that should be in a typeclass
-fstabToCIFS :: FSTabEntry -> RofiIO MountConf CIFS
-fstabToCIFS FSTabEntry{ fstabSpec = s, fstabDir = d, fstabOptions = o } = do
-  -- If the options specify "guest" don't require a password. Else try to find a
-  -- means to get the password from the command line options provided for the
-  -- this mountpoint. If nothing is found, prompt for a password. In any case,
-  -- the output will be passed to env variable PASSWD when mounting this cifs
-  -- directory and cause it to fail. Setting the env variable is necessary as
-  -- the cifs mount call will prompt for a password and hang otherwise.
-  pwd <- if M.member "guest" o
-         then return Nothing
-         else asks $ Just . M.findWithDefault readPassword d . passwords
-  let r = Removable { deviceSpec = smartSlashPrefix s, label = takeFileName d }
-  return $ CIFS r d pwd
-  where
-    smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
+instance StaticDevice CIFS CIFSConfig where
+  configToDev v CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
+                           , _cifsRemote = t
+                           , _cifsPassword = p } =
+    let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
+    in CIFS r (appendRoot v m) $ configToPwd <$> p
+    where
+      smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
 
 --------------------------------------------------------------------------------
 -- | SSHFS Devices
@@ -316,11 +434,11 @@ fstabToCIFS FSTabEntry{ fstabSpec = s, fstabDir = d, fstabOptions = o } = do
 data SSHFS = SSHFS Removable FilePath
 
 instance Mountable SSHFS where
-  mount (SSHFS Removable{ label = l } m) False =
+  mount (SSHFS Removable{ deviceSpec = d, label = l } m) False = do
     bracketOnError_
       (mkDirMaybe m)
       (rmDirMaybe m)
-      (io $ runMountNotify "mount" [m] l False)
+      (io $ runMountNotify "sshfs" [d, m] l False)
 
   mount (SSHFS Removable{ label = l } m) True = umountNotify l m
 
@@ -330,10 +448,11 @@ instance Mountable SSHFS where
 
   fmtEntry (SSHFS r _) = fmtEntry r
 
-fstabToSSHFS :: FSTabEntry -> RofiIO MountConf SSHFS
-fstabToSSHFS FSTabEntry{ fstabSpec = s, fstabDir = d } = return $ SSHFS r d
-  where
-    r = Removable { deviceSpec = s, label = takeFileName d }
+instance StaticDevice SSHFS SSHFSConfig where
+  configToDev v SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
+                            , _sshfsRemote = t } =
+    let r = Removable { deviceSpec = t, label = takeFileName m }
+    in SSHFS r (appendRoot v m)
 
 --------------------------------------------------------------------------------
 -- | VeraCrypt Devices
@@ -370,13 +489,12 @@ runVeraCrypt stdin args = do
   where
     defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
 
-getVeracryptDevices :: RofiIO MountConf [VeraCrypt]
-getVeracryptDevices = mapM toDev =<< asks vcMounts
-  where
-    toDev (d, s) = do
-      pwd <- asks $ Just . M.findWithDefault readPassword d . passwords
-      let r = Removable { deviceSpec = s, label = takeFileName d }
-      return $ VeraCrypt r d pwd
+instance StaticDevice VeraCrypt VeracryptConfig where
+  configToDev v VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
+                                , _veracryptVolume = t
+                                , _veracryptPassword = p } =
+    let r = Removable { deviceSpec = t, label = takeFileName m }
+    in VeraCrypt r (appendRoot v m) $ configToPwd <$> p
 
 --------------------------------------------------------------------------------
 -- | MTP devices
@@ -452,8 +570,8 @@ data Systemd = Systemd
 instance Mountable Systemd where
   mount s@Systemd { sysdInstance = i } m = let
     unit = fmtSysdInstanceName s
-    op = if m then "stop" else "start" in
-    io $ runMountNotify "systemctl" ["--user", op, unit] i m
+    operation = if m then "stop" else "start" in
+    io $ runMountNotify "systemctl" ["--user", operation, unit] i m
 
   allInstalled Systemd { sysdType = SystemdVeracrypt } =
     io $ isJust <$> findExecutable "veracrypt"
@@ -524,64 +642,6 @@ class Mountable a where
       mountedPrefix False True = "  "
       mountedPrefix True True  = "* "
       mountedPrefix _ False    = "! "
-
--- TODO add truecrypt volumes
---------------------------------------------------------------------------------
--- | Fstab devices
---
--- Functions to gather all user fstab mounts on the system
-
--- | Intermediate structure to hold fstab devices
-data FSTab = FSTab
-    { sshfsDevices :: [SSHFS]
-    , cifsDevices  :: [CIFS]
-    -- , veracryptDevices :: [VeraCrypt]
-    }
-
--- | Data structure representing an fstab device (or one line in the fstab file)
-data FSTabEntry = FSTabEntry
-    { fstabSpec    :: String
-    , fstabDir     :: FilePath
-    , fstabType    :: String
-    , fstabOptions :: MountOptions
-    }
-
--- | Key/val pairs to represent mount options. A Nothing for the value signifies
--- a standalone option (eg 'rw' and 'ro')
-type MountOptions = M.Map String (Maybe String)
-
--- | Return all user fstab devices from /etc/fstab
-readFSTab :: RofiIO MountConf FSTab
-readFSTab = do
-  -- let i = FSTab { sshfsDevices = [], cifsDevices = [], veracryptDevices = []}
-  let i = FSTab { sshfsDevices = [], cifsDevices = []}
-  fstab <- io $ readFile "/etc/fstab"
-  foldM addFstabDevice i $ fromLines toEntry $ lines fstab
-  where
-    toEntry line = case words line of
-      (('#':_):_)                     -> Nothing
-      [spec, dir, fsType, opts, _, _] -> Just $ FSTabEntry
-                                         { fstabSpec = spec
-                                         , fstabDir = dir
-                                         , fstabType = fsType
-                                         , fstabOptions = parseOptions opts
-                                         }
-      _                               -> Nothing
-    parseOptions = M.fromList . fromCommaSepString
-
--- | Add entry to the fstab devices list, but only if it is a known user mount
-addFstabDevice :: FSTab -> FSTabEntry -> RofiIO MountConf FSTab
-addFstabDevice f@FSTab{..} e@FSTabEntry{..}
-  | M.notMember "users" fstabOptions = return f
-  | fstabType == "cifs" =
-    (\d -> f { cifsDevices = append d cifsDevices }) <$> fstabToCIFS e
-  | fstabType == "fuse.sshfs" =
-    (\d -> f { sshfsDevices = append d sshfsDevices }) <$> fstabToSSHFS e
-  -- | fstabType == "veracrypt" =
-  --   (\d -> f { veracryptDevices = append d veracryptDevices }) <$> fstabToVeraCrypt e
-  | otherwise = return f
-  where
-    append x xs = xs ++ [x]
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
@@ -668,17 +728,5 @@ splitBy delimiter = foldr f [[]]
     f c l@(x:xs) | c == delimiter = []:l
                  | otherwise = (c:x):xs
 
--- | Like fromCommaSepString but only return substrings with '='
-fromCommaSepString' :: String -> [(String, String)]
-fromCommaSepString' s = [(k, v) | (k, Just v) <- fromCommaSepString s]
-
--- | Split a string of comma-separated values into an alist
--- If the substrings have an '=' in them, the left side will become the key and
--- the right will become the value of the cell. If there is not '=' then the
--- entire substring will become the key and the value will be Nothing
-fromCommaSepString :: String -> [(String, Maybe String)]
-fromCommaSepString = fmap (toCell . splitEq) . splitBy ','
-  where
-    splitEq e = e =~ ("=" :: String) :: (String, String, String)
-    toCell (k, "=", v) = (k, Just v)
-    toCell (k, _, _)   = (k, Nothing)
+appendRoot :: FilePath -> FilePath -> FilePath
+appendRoot root path = if isRelative path then root </> path else path
