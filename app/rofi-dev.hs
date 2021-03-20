@@ -1,6 +1,3 @@
-{-# LANGUAGE MultiParamTypeClasses  #-}
-{-# LANGUAGE ScopedTypeVariables  #-}
-{-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE ViewPatterns   #-}
@@ -29,8 +26,6 @@ import qualified Data.Text as T
 import qualified Data.Vector as V
 import           Data.Yaml
 
-import           GHC.Generics()
-
 import           Rofi.Command
 
 import           Text.Printf
@@ -50,7 +45,6 @@ main = getArgs >>= parse
 
 parse :: [String] -> IO ()
 parse args = case getOpt Permute options args of
-  -- (o, n, [])   -> initMountConf n >>= \i -> runMounts $ foldl (flip id) i o
   (o, n, [])   -> runMounts $ foldl (flip id) (defaultOpts n) o
   (_, _, errs) -> ioError $ userError $ concat errs ++ usageInfo h options
   where
@@ -176,7 +170,9 @@ instance FromJSON DeviceConfig where
         <*> o .: "volume"
         <*> o .:& "depends"
         <*> o .:? "password"
-      _           -> fail "unknown device type"
+      -- TODO make this skip adding an entry to the map rather than skipping the
+      -- map entirely
+      _           -> fail $ "unknown device type: " ++ devType
 
 data StaticConfig = StaticConfig
   { _staticconfigTmpPath :: Maybe String
@@ -187,26 +183,6 @@ instance FromJSON StaticConfig where
   parseJSON = withObject "devices" $ \o -> StaticConfig
     <$> o .:? "mountdir"
     <*> o .: "devices"
-
---------------------------------------------------------------------------------
--- | Static Devices typeclass
---
--- A class to represent devices defined in the static configuration (eg the YAML
--- file). Its methods define the machinery to extract specific devies types
--- from the parse tree.
-
-fromConfig :: M.Map String DeviceConfig -> RofiIO MountConf [DevTriple]
-fromConfig st = do
-  p <- asks mountconfVolatilePath
-  mapM (configToDev p st) $ M.elems st
-
-foldTriples :: [Triple a b c] -> ([a], [b], [c])
-foldTriples = foldl stackTriples ([], [], [])
-
-stackTriples :: ([a], [b], [c]) -> Triple a b c -> ([a], [b], [c])
-stackTriples (c, v, s) (First x)  = (x:c, v, s)
-stackTriples (c, v, s) (Second x) = (c, x:v, s)
-stackTriples (c, v, s) (Third x) = (c, v, x:s)
 
 --------------------------------------------------------------------------------
 -- | Global config used in the reader monad stack
@@ -306,7 +282,7 @@ runPrompt gs = selectAction $ emptyMenu
 getGroups :: RofiIO MountConf [RofiGroup MountConf]
 getGroups = do
   sysd <- io getSystemdDevices
-  (cifsDevs, sshfsDevs, vcDevs) <- foldTriples
+  (cifsDevs, sshfsDevs, vcDevs) <- groupTriples
     <$> (fromConfig =<< asks mountconfStaticDevs)
   sequence
     [ mkGroup2 "SSHFS Devices" (filterSysd SystemdSSHFS sysd) sshfsDevs
@@ -414,7 +390,7 @@ getRemovableDevices = fromLines toDev . lines
 -- This wraps the Removable device (since it is removable) and also adds its
 -- own mount options and passwords for authentication.
 
-data CIFS = CIFS Removable FilePath (Maybe PasswordGetter) Dependency
+data CIFS = CIFS Removable FilePath (Maybe PasswordGetter) Dependencies
 
 instance Show CIFS where
   show (CIFS r f _ d) = unwords [show r, show f, "<Pwd>", show d]
@@ -449,7 +425,7 @@ instance Mountable CIFS where
 -- config that specifies the port, hostname, user, and identity file, these
 -- need to be passed as mount options.
 
-data SSHFS = SSHFS Removable FilePath Dependency deriving Show
+data SSHFS = SSHFS Removable FilePath Dependencies deriving Show
 
 instance Mountable SSHFS where
   mount (SSHFS Removable{ deviceSpec = d, label = l } m deps) False = do
@@ -471,7 +447,7 @@ instance Mountable SSHFS where
 -- | VeraCrypt Devices
 --
 
-data VeraCrypt = VeraCrypt Removable FilePath (Maybe PasswordGetter) Dependency
+data VeraCrypt = VeraCrypt Removable FilePath (Maybe PasswordGetter) Dependencies
 
 instance Show VeraCrypt where
   show (VeraCrypt r f _ d) = unwords [show r, show f, show d]
@@ -505,69 +481,6 @@ runVeraCrypt stdin args = do
   readCmdEither "sudo" (defaultArgs ++ args) stdin
   where
     defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
-
-data Triple a b c = First a | Second b | Third c deriving Show
-
-type DevTriple = Triple CIFS SSHFS VeraCrypt
-
--- TODO abstract parts of this away in new typeclass for static devices
-configToDev :: FilePath -> M.Map String DeviceConfig -> DeviceConfig
-  -> RofiIO MountConf DevTriple
-configToDev v s CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
-                           , _cifsRemote = t
-                           , _cifsDepends = d
-                           , _cifsPassword = p } = do
-  -- stuff like this is totally refactorable
-  let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ First $ CIFS r (appendRoot v m) (configToPwd <$> p) d'
-  where
-    smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
-configToDev v s SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
-                            , _sshfsDepends = d
-                            , _sshfsRemote = t } = do
-  let r = Removable { deviceSpec = t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ Second $ SSHFS r (appendRoot v m) d'
-configToDev v s VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
-                                , _veracryptVolume = t
-                                , _veracryptDepends = d
-                                , _veracryptPassword = p } = do
-  let r = Removable { deviceSpec = t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ Third $ VeraCrypt r (appendRoot v m) (configToPwd <$> p) d'
-
---------------------------------------------------------------------------------
--- | Dependencies
---
--- Define a data structure that allows one device to depend on another. Since
--- each device is different and has a different typeclass instance, need to
--- include slots for all possible devices. For now only deal with static
--- devices.
-
-data Dependency = Dependency
-  { dependencySSHFS :: [SSHFS]
-  , dependencyCIFS :: [CIFS]
-  , dependencyVeracrypt :: [VeraCrypt]
-  } deriving Show
-
-getDependencies :: M.Map String DeviceConfig -> [String] -> RofiIO MountConf Dependency
-getDependencies devMap aliases = do
-  (c, s, v) <- fmap foldTriples
-    $ fromConfig $ M.filterWithKey (\k _ -> k `elem` aliases) devMap
-  return Dependency { dependencyCIFS = c
-                    , dependencySSHFS = s
-                    , dependencyVeracrypt = v}
-
-mountDependencies :: Dependency -> RofiIO MountConf ()
-mountDependencies Dependency { dependencyCIFS = c
-                             , dependencySSHFS = s
-                             , dependencyVeracrypt = v
-                             } =
-  mountAll c >> mountAll s >> mountAll v
-  where
-    mountAll :: Mountable a => [a] -> RofiIO MountConf ()
-    mountAll = mapM_ (\d -> isMounted d >>= (\r -> unless r $ mount d False))
 
 --------------------------------------------------------------------------------
 -- | MTP devices
@@ -679,6 +592,79 @@ getSystemdDevices = do
       Just $ Systemd { sysdType = SystemdSSHFS , sysdInstance = s }
     toDev _ = Nothing
     splitInstance p = fmap (takeWhile (not . (==) '.')) . stripPrefix p
+
+--------------------------------------------------------------------------------
+-- | Static Device Wrapper
+--
+-- In order to make a consistent interface for the static device types, create
+-- a wrapper type to encapsulate them.
+
+-- | a sum-type wrapper for three different types, obviously this will change
+-- if/when I add more static devices and their types
+data Triple a b c = First a | Second b | Third c deriving Show
+
+-- | Specific wrapper for static devices
+type StaticDeviceTriple = Triple CIFS SSHFS VeraCrypt
+
+fromConfig :: M.Map String DeviceConfig -> RofiIO MountConf [StaticDeviceTriple]
+fromConfig st = do
+  p <- asks mountconfVolatilePath
+  mapM (configToDev p st) $ M.elems st
+
+-- TODO abstract parts of this away in new typeclass for static devices
+configToDev :: FilePath -> M.Map String DeviceConfig -> DeviceConfig
+  -> RofiIO MountConf StaticDeviceTriple
+configToDev v s CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
+                           , _cifsRemote = t
+                           , _cifsDepends = d
+                           , _cifsPassword = p } = do
+  -- stuff like this is totally refactorable
+  let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ First $ CIFS r (appendRoot v m) (configToPwd <$> p) d'
+  where
+    smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
+configToDev v s SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
+                            , _sshfsDepends = d
+                            , _sshfsRemote = t } = do
+  let r = Removable { deviceSpec = t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ Second $ SSHFS r (appendRoot v m) d'
+configToDev v s VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
+                                , _veracryptVolume = t
+                                , _veracryptDepends = d
+                                , _veracryptPassword = p } = do
+  let r = Removable { deviceSpec = t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ Third $ VeraCrypt r (appendRoot v m) (configToPwd <$> p) d'
+
+groupTriples :: [Triple a b c] -> ([a], [b], [c])
+groupTriples = foldl stackTriples ([], [], [])
+
+stackTriples :: ([a], [b], [c]) -> Triple a b c -> ([a], [b], [c])
+stackTriples (c, v, s) (First x)  = (x:c, v, s)
+stackTriples (c, v, s) (Second x) = (c, x:v, s)
+stackTriples (c, v, s) (Third x) = (c, v, x:s)
+
+--------------------------------------------------------------------------------
+-- | Static Dependencies
+--
+-- Define a data structure that allows one device to depend on another.
+
+newtype Dependencies = Dependencies [StaticDeviceTriple] deriving Show
+
+getDependencies :: M.Map String DeviceConfig -> [String] -> RofiIO MountConf Dependencies
+getDependencies devMap aliases = fmap Dependencies
+  $ fromConfig $ M.filterWithKey (\k _ -> k `elem` aliases) devMap
+
+mountDependencies :: Dependencies -> RofiIO MountConf ()
+mountDependencies (Dependencies d) = mapM_ mount' d
+  where
+    -- this looks stupid but all these mount calls are technically different
+    -- functions because class instances
+    mount' (First m) = mount m False
+    mount' (Second m) = mount m False
+    mount' (Third m) = mount m False
 
 --------------------------------------------------------------------------------
 -- | Mountable typeclass
