@@ -103,18 +103,6 @@ instance FromJSON MountConfig where
     <$> o .: "mountpoint"
     <*> o .:? "label"
 
-data DependsConfig = DependsConfig
-  { _dependsVeracrypt :: V.Vector String
-  , _dependsSSHFS :: V.Vector String
-  , _dependsCIFS :: V.Vector String
-  } deriving Show
-
-instance FromJSON DependsConfig where
-  parseJSON = withObject "depends" $ \o -> DependsConfig
-    <$> o .:& "veracrypt" 
-    <*> o .:& "sshfs"
-    <*> o .:& "cifs"
-
 data BitwardenConfig = BitwardenConfig
   { _bitwardenKey :: String
   , _bitwardenTries :: Integer }
@@ -153,105 +141,52 @@ instance FromJSON PasswordConfig where
     <$> o .:? "bitwarden"
     <*> o .:? "libsecret"
     <*> o .:? "prompt"
-                       
-data VeracryptConfig = VeracryptConfig
+
+data DeviceConfig = VeracryptConfig
   { _veracryptMount :: MountConfig
   , _veracryptVolume :: String
-  , _veracryptDepends :: Maybe DependsConfig
+  , _veracryptDepends :: V.Vector String
   , _veracryptPassword :: Maybe PasswordConfig
-  } deriving Show
-
-instance FromJSON VeracryptConfig where
-  parseJSON = withObject "veracrypt" $ \o -> VeracryptConfig
-    <$> o .: "mount"
-    <*> o .: "volume"
-    <*> o .:? "depends"
-    <*> o .:? "password"
-
-data SSHFSConfig = SSHFSConfig
+  } | SSHFSConfig
   { _sshfsMount :: MountConfig
   , _sshfsRemote :: String
-  , _sshfsDepends :: Maybe DependsConfig
-  } deriving Show
-
-instance FromJSON SSHFSConfig where
-  parseJSON = withObject "sshfs" $ \o -> SSHFSConfig
-    <$> o .: "mount"
-    <*> o .: "remote"
-    <*> o .:? "depends"
-
-data CIFSConfig = CIFSConfig
+  , _sshfsDepends :: V.Vector String
+  } | CIFSConfig
   { _cifsMount :: MountConfig
   , _cifsRemote :: String
-  , _cifsDepends :: Maybe DependsConfig
+  , _cifsDepends :: V.Vector String
   , _cifsPassword :: Maybe PasswordConfig
   } deriving Show
 
-instance FromJSON CIFSConfig where
-  parseJSON = withObject "cifs" $ \o -> CIFSConfig
-    <$> o .: "mount"
-    <*> o .: "remote"
-    <*> o .:? "depends"
-    <*> o .:? "password"
-
--- data DeviceConfig = VeracryptConfig
---   { _veracryptMount :: MountConfig
---   , _veracryptVolume :: String
---   , _veracryptDepends :: Maybe DependsConfig
---   , _veracryptPassword :: Maybe PasswordConfig
---   } | SSHFSConfig
---   { _sshfsMount :: MountConfig
---   , _sshfsRemote :: String
---   , _sshfsDepends :: Maybe DependsConfig
---   } | CIFSConfig
---   { _cifsMount :: MountConfig
---   , _cifsRemote :: String
---   , _cifsDepends :: Maybe DependsConfig
---   , _cifsPassword :: Maybe PasswordConfig
---   } deriving Show
-
--- instance FromJSON DeviceConfig where
---   parseJSON = withObject "devices" $ \o -> do
---     devType <- o .: "type"
---     case devType of
---       "cifs"      -> CIFSConfig
---         <$> o .: "mount"
---         <*> o .: "remote"
---         <*> o .:? "depends"
---         <*> o .:? "password"
---       "sshfs"     -> SSHFSConfig
---         <$> o .: "mount"
---         <*> o .: "remote"
---         <*> o .:? "depends"
---       "veracrypt" -> VeracryptConfig
---         <$> o .: "mount"
---         <*> o .: "volume"
---         <*> o .:? "depends"
---         <*> o .:? "password"
---       _           -> fail "unknown device type"
-
-data DevicesConfig = DevicesConfig
-  { _veracryptConfigs :: M.Map String VeracryptConfig
-  , _sshfsConfigs :: M.Map String SSHFSConfig
-  , _cifsConfigs :: M.Map String CIFSConfig
-  } deriving Show
-
-instance FromJSON DevicesConfig where
-  parseJSON = withObject "devices" $ \o -> DevicesConfig
-    <$> o .: "veracrypt"
-    <*> o .: "sshfs"
-    <*> o .: "cifs"
+instance FromJSON DeviceConfig where
+  parseJSON = withObject "devices" $ \o -> do
+    devType <- o .: "type"
+    case (devType :: String) of
+      "cifs"      -> CIFSConfig
+        <$> o .: "mount"
+        <*> o .: "remote"
+        <*> o .:& "depends"
+        <*> o .:? "password"
+      "sshfs"     -> SSHFSConfig
+        <$> o .: "mount"
+        <*> o .: "remote"
+        <*> o .:& "depends"
+      "veracrypt" -> VeracryptConfig
+        <$> o .: "mount"
+        <*> o .: "volume"
+        <*> o .:& "depends"
+        <*> o .:? "password"
+      _           -> fail "unknown device type"
 
 data StaticConfig = StaticConfig
   { _staticconfigTmpPath :: Maybe String
-  , _staticconfigDevices :: Maybe DevicesConfig
-  -- , _staticconfigDevices :: M.Map String DeviceConfig
+  , _staticconfigDevices :: M.Map String DeviceConfig
   } deriving Show
 
 instance FromJSON StaticConfig where
   parseJSON = withObject "devices" $ \o -> StaticConfig
     <$> o .:? "mountdir"
-    <*> o .:? "devices"
+    <*> o .: "devices"
 
 --------------------------------------------------------------------------------
 -- | Static Devices typeclass
@@ -260,16 +195,18 @@ instance FromJSON StaticConfig where
 -- file). Its methods define the machinery to extract specific devies types
 -- from the parse tree.
 
-class Mountable m => StaticDevice m a where
-  fromConfig :: DevicesConfig -> (DevicesConfig -> M.Map String a) -> RofiIO MountConf [m]
-  fromConfig s f = fromConfig' s (M.elems . f)
+fromConfig :: M.Map String DeviceConfig -> RofiIO MountConf [DevTriple]
+fromConfig st = do
+  p <- asks mountconfVolatilePath
+  mapM (configToDev p st) $ M.elems st
 
-  fromConfig' :: DevicesConfig -> (DevicesConfig -> [a]) -> RofiIO MountConf [m]
-  fromConfig' s f = do
-    v <- asks mountconfVolatilePath
-    mapM (configToDev v s) $ f s
+foldTriples :: [Triple a b c] -> ([a], [b], [c])
+foldTriples = foldl stackTriples ([], [], [])
 
-  configToDev :: FilePath -> DevicesConfig -> a -> RofiIO MountConf m
+stackTriples :: ([a], [b], [c]) -> Triple a b c -> ([a], [b], [c])
+stackTriples (c, v, s) (First x)  = (x:c, v, s)
+stackTriples (c, v, s) (Second x) = (c, x:v, s)
+stackTriples (c, v, s) (Third x) = (c, v, x:s)
 
 --------------------------------------------------------------------------------
 -- | Global config used in the reader monad stack
@@ -284,7 +221,7 @@ class Mountable m => StaticDevice m a where
 data MountConf = MountConf
     { mountconfVolatilePath :: FilePath
     , mountconfRofiArgs     :: [String]
-    , mountconfStaticDevs   :: Maybe DevicesConfig
+    , mountconfStaticDevs   :: M.Map String DeviceConfig
     }
 
 instance RofiConf MountConf where
@@ -343,7 +280,7 @@ runMounts opts = do
   static <- join <$> traverse parseStaticConfig (optsConfig opts)
   defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
   let tmpPath = fromMaybe defaultTmpPath (_staticconfigTmpPath =<< static)
-  let staticDevs = _staticconfigDevices =<< static
+  let staticDevs = maybe M.empty _staticconfigDevices static
   let mountconf = MountConf
         { mountconfVolatilePath = tmpPath
         , mountconfRofiArgs = optsRofiArgs opts
@@ -369,7 +306,8 @@ runPrompt gs = selectAction $ emptyMenu
 getGroups :: RofiIO MountConf [RofiGroup MountConf]
 getGroups = do
   sysd <- io getSystemdDevices
-  (cifsDevs, sshfsDevs, vcDevs) <- getStaticDevices
+  (cifsDevs, sshfsDevs, vcDevs) <- foldTriples
+    <$> (fromConfig =<< asks mountconfStaticDevs)
   sequence
     [ mkGroup2 "SSHFS Devices" (filterSysd SystemdSSHFS sysd) sshfsDevs
     , mkGroup "CIFS Devices" cifsDevs
@@ -383,30 +321,16 @@ getGroups = do
 mountByAlias :: Bool -> String -> RofiIO MountConf ()
 mountByAlias unmountFlag alias = do
   static <- asks mountconfStaticDevs
-  forM_ static $ \static' -> do
-    volatilePath <- asks mountconfVolatilePath
-    c <- toDev volatilePath static' _cifsConfigs alias
-    s <- toDev volatilePath static' _sshfsConfigs alias
-    v <- toDev volatilePath static' _veracryptConfigs alias
-    mountIfJust (c :: Maybe CIFS)
-      $ mountIfJust (s :: Maybe SSHFS)
-      $ mountIfJust (v :: Maybe VeraCrypt) (return ())
+  volatilePath <- asks mountconfVolatilePath
+  forM_(M.lookup alias static) $ \d -> do
+    res <- configToDev volatilePath static d
+    case res of
+      First d'  -> mount' d'
+      Second d' -> mount' d'
+      Third d'  -> mount' d'
   where
-    toDev v s f = mapM (configToDev v s) . aliasToDevice s f
-    mountIfJust a b = if isNothing a then b else forM_ a $ flip mount unmountFlag
-
-aliasToDevice :: DevicesConfig -> (DevicesConfig -> M.Map String a) -> String -> Maybe a
-aliasToDevice d f = flip M.lookup (f d)
-
-getStaticDevices :: RofiIO MountConf ([CIFS], [SSHFS], [VeraCrypt])
-getStaticDevices = do
-  static <- asks mountconfStaticDevs
-  maybe (return ( [] :: [CIFS], [] :: [SSHFS], [] :: [VeraCrypt]))
-    (\c -> liftM3 (,,)
-           (fromConfig c _cifsConfigs)
-           (fromConfig c _sshfsConfigs)
-           (fromConfig c _veracryptConfigs))
-    static
+    mount' :: Mountable a => a -> RofiIO MountConf ()
+    mount' = flip mount unmountFlag
 
 mkGroup :: Mountable d => String -> [d] -> RofiIO MountConf (RofiGroup MountConf)
 mkGroup header devs = sortGroup header <$> mapM mkAction devs
@@ -517,17 +441,6 @@ instance Mountable CIFS where
 
   fmtEntry (CIFS r _ _ _) = fmtEntry r
 
-instance StaticDevice CIFS CIFSConfig where
-  configToDev v s CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
-                             , _cifsRemote = t
-                             , _cifsDepends = d
-                             , _cifsPassword = p } = do
-    let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
-    d' <- maybe (return initDependencies) (getDependencies s) d
-    return $ CIFS r (appendRoot v m) (configToPwd <$> p) d'
-    where
-      smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
-
 --------------------------------------------------------------------------------
 -- | SSHFS Devices
 --
@@ -553,14 +466,6 @@ instance Mountable SSHFS where
   isMounted (SSHFS _ dir _) = io $ isDirMounted dir
 
   fmtEntry (SSHFS r _ _) = fmtEntry r
-
-instance StaticDevice SSHFS SSHFSConfig where
-  configToDev v s SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
-                              , _sshfsDepends = d
-                              , _sshfsRemote = t } = do
-    let r = Removable { deviceSpec = t, label = takeFileName m }
-    d' <- maybe (return initDependencies) (getDependencies s) d
-    return $ SSHFS r (appendRoot v m) d'
 
 --------------------------------------------------------------------------------
 -- | VeraCrypt Devices
@@ -601,14 +506,36 @@ runVeraCrypt stdin args = do
   where
     defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
 
-instance StaticDevice VeraCrypt VeracryptConfig where
-  configToDev v s VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
-                                  , _veracryptVolume = t
-                                  , _veracryptDepends = d
-                                  , _veracryptPassword = p } = do
-    let r = Removable { deviceSpec = t, label = takeFileName m }
-    d' <- maybe (return initDependencies) (getDependencies s) d
-    return $ VeraCrypt r (appendRoot v m) (configToPwd <$> p) d'
+data Triple a b c = First a | Second b | Third c deriving Show
+
+type DevTriple = Triple CIFS SSHFS VeraCrypt
+
+-- TODO abstract parts of this away in new typeclass for static devices
+configToDev :: FilePath -> M.Map String DeviceConfig -> DeviceConfig
+  -> RofiIO MountConf DevTriple
+configToDev v s CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
+                           , _cifsRemote = t
+                           , _cifsDepends = d
+                           , _cifsPassword = p } = do
+  -- stuff like this is totally refactorable
+  let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ First $ CIFS r (appendRoot v m) (configToPwd <$> p) d'
+  where
+    smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
+configToDev v s SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
+                            , _sshfsDepends = d
+                            , _sshfsRemote = t } = do
+  let r = Removable { deviceSpec = t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ Second $ SSHFS r (appendRoot v m) d'
+configToDev v s VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
+                                , _veracryptVolume = t
+                                , _veracryptDepends = d
+                                , _veracryptPassword = p } = do
+  let r = Removable { deviceSpec = t, label = takeFileName m }
+  d' <- getDependencies s $ V.toList d
+  return $ Third $ VeraCrypt r (appendRoot v m) (configToPwd <$> p) d'
 
 --------------------------------------------------------------------------------
 -- | Dependencies
@@ -624,24 +551,13 @@ data Dependency = Dependency
   , dependencyVeracrypt :: [VeraCrypt]
   } deriving Show
 
-initDependencies :: Dependency
-initDependencies = Dependency [] [] []
-
-getDependencies :: DevicesConfig -> DependsConfig -> RofiIO MountConf Dependency 
-getDependencies devConf DependsConfig { _dependsCIFS = c
-                                      , _dependsSSHFS = s
-                                      , _dependsVeracrypt = v} = do
-  c' <- getDepConfigs c _cifsConfigs
-  s' <- getDepConfigs s _sshfsConfigs
-  v' <- getDepConfigs v _veracryptConfigs
-  return Dependency
-    { dependencyCIFS = c'
-    , dependencySSHFS = s'
-    , dependencyVeracrypt = v'
-    }
-  where
-    getDepConfigs aliases getConfig = fromConfig' devConf
-      $ M.elems . M.filterWithKey (\k _ -> k `elem` V.toList aliases) . getConfig
+getDependencies :: M.Map String DeviceConfig -> [String] -> RofiIO MountConf Dependency
+getDependencies devMap aliases = do
+  (c, s, v) <- fmap foldTriples
+    $ fromConfig $ M.filterWithKey (\k _ -> k `elem` aliases) devMap
+  return Dependency { dependencyCIFS = c
+                    , dependencySSHFS = s
+                    , dependencyVeracrypt = v}
 
 mountDependencies :: Dependency -> RofiIO MountConf ()
 mountDependencies Dependency { dependencyCIFS = c
