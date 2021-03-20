@@ -1,6 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
-{-# LANGUAGE ViewPatterns   #-}
 
 --------------------------------------------------------------------------------
 -- | rofi-dev - a rofi prompt for mountable devices
@@ -33,7 +32,6 @@ import           Text.Printf
 import           System.Console.GetOpt
 import           System.Directory
 import           System.Environment
-import           System.Exit (ExitCode(..))
 import           System.FilePath.Posix
 import           System.Posix.User     (getEffectiveUserName)
 import           System.Process
@@ -281,18 +279,15 @@ runPrompt gs = selectAction $ emptyMenu
 
 getGroups :: RofiIO MountConf [RofiGroup MountConf]
 getGroups = do
-  sysd <- io getSystemdDevices
   (cifsDevs, sshfsDevs, vcDevs) <- groupTriples
     <$> (fromConfig =<< asks mountconfStaticDevs)
   sequence
-    [ mkGroup2 "SSHFS Devices" (filterSysd SystemdSSHFS sysd) sshfsDevs
+    [ mkGroup "SSHFS Devices" sshfsDevs
     , mkGroup "CIFS Devices" cifsDevs
-    , mkGroup2 "Veracrypt Devices" (filterSysd SystemdVeracrypt sysd) vcDevs
+    , mkGroup "Veracrypt Devices" vcDevs
     , mkGroup "Removable Devices"  =<< getRemovableDevices
     , mkGroup "MTP Devices" =<< getMTPDevices
     ]
-  where
-    filterSysd t = filter (\s -> sysdType s == t)
 
 mountByAlias :: Bool -> String -> RofiIO MountConf ()
 mountByAlias unmountFlag alias = do
@@ -310,13 +305,6 @@ mountByAlias unmountFlag alias = do
 
 mkGroup :: Mountable d => String -> [d] -> RofiIO MountConf (RofiGroup MountConf)
 mkGroup header devs = sortGroup header <$> mapM mkAction devs
-
-mkGroup2 :: (Mountable d, Mountable e) => String
-  -> [d] -> [e] -> RofiIO MountConf (RofiGroup MountConf)
-mkGroup2 header devs1 devs2 = do
-  r1 <- mapM mkAction devs1
-  r2 <- mapM mkAction devs2
-  return $ sortGroup header (r1 ++ r2)
 
 sortGroup :: String -> [(String, RofiIO MountConf ())] -> RofiGroup MountConf
 sortGroup header = titledGroup header . alignEntries . toRofiActions
@@ -541,57 +529,6 @@ getMTPDevices = do
       | c `elem` ("\"*/:<>?\\|" :: String) = Nothing
       | c == ' ' = Just '-'
       | otherwise = Just c
-
---------------------------------------------------------------------------------
--- | Systemd typeclass
-
-data SystemdMountType = SystemdVeracrypt | SystemdSSHFS deriving (Eq, Show)
-  
-data Systemd = Systemd
-    { sysdType     :: SystemdMountType
-    , sysdInstance :: String
-    }
-    deriving (Eq, Show)
-
-instance Mountable Systemd where
-  mount s@Systemd { sysdInstance = i } m = let
-    unit = fmtSysdInstanceName s
-    operation = if m then "stop" else "start" in
-    io $ runMountNotify "systemctl" ["--user", operation, unit] i m
-
-  allInstalled Systemd { sysdType = SystemdVeracrypt } =
-    io $ isJust <$> findExecutable "veracrypt"
-
-  allInstalled Systemd { sysdType = SystemdSSHFS } =
-    io $ isJust <$> findExecutable "sshfs"
-
-  isMounted s = let
-    unit = fmtSysdInstanceName s
-    args = ["--user", "is-active", "--quiet", unit] in
-    io $ (\(ec, _, _) -> ec == ExitSuccess)
-    <$> readProcessWithExitCode "systemctl" args ""
-
-  fmtEntry Systemd { sysdInstance = i } = i ++ alignSepPre ++ "Systemd"
-
-fmtSysdInstanceName :: Systemd -> String
-fmtSysdInstanceName Systemd { sysdType = SystemdVeracrypt, sysdInstance = i } =
-  "mount-veracrypt@" ++ i ++ ".service"
-fmtSysdInstanceName Systemd { sysdType = SystemdSSHFS, sysdInstance = i } =
-  "mount-sshfs@" ++ i ++ ".service"
-
-getSystemdDevices :: IO [Systemd]
-getSystemdDevices = do
-  systemdHome <- io $ getXdgDirectory XdgConfig "systemd/user"
-  io $ mapMaybe toDev
-    <$> (filterM (doesDirectoryExist . (systemdHome </>))
-    =<< listDirectory systemdHome)
-  where
-    toDev (splitInstance "mount-veracrypt@" -> Just s) =
-      Just $ Systemd { sysdType = SystemdVeracrypt , sysdInstance = s }
-    toDev (splitInstance "mount-sshfs@" -> Just s) =
-      Just $ Systemd { sysdType = SystemdSSHFS , sysdInstance = s }
-    toDev _ = Nothing
-    splitInstance p = fmap (takeWhile (not . (==) '.')) . stripPrefix p
 
 --------------------------------------------------------------------------------
 -- | Static Device Wrapper
