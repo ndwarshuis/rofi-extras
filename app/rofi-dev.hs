@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards   #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 --------------------------------------------------------------------------------
 -- | rofi-dev - a rofi prompt for mountable devices
@@ -19,7 +20,7 @@ import           Data.Either
 import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
-import qualified Data.Map.Ordered      as O
+-- import qualified Data.Map.Ordered      as O
 import           Data.Maybe
 import qualified Data.Text as T
 import qualified Data.Vector as V
@@ -134,47 +135,54 @@ instance FromJSON PasswordConfig where
     <*> o .:? "libsecret"
     <*> o .:? "prompt"
 
-data DeviceConfig = VeracryptConfig
-  { _veracryptMount :: MountConfig
-  , _veracryptVolume :: String
-  , _veracryptDepends :: V.Vector String
+data DataConfig = VeracryptConfig
+  { _veracryptVolume :: String
   , _veracryptPassword :: Maybe PasswordConfig
   } | SSHFSConfig
-  { _sshfsMount :: MountConfig
-  , _sshfsRemote :: String
-  , _sshfsDepends :: V.Vector String
+  { _sshfsRemote :: String
   } | CIFSConfig
-  { _cifsMount :: MountConfig
-  , _cifsRemote :: String
-  , _cifsDepends :: V.Vector String
+  { _cifsRemote :: String
   , _cifsPassword :: Maybe PasswordConfig
   } deriving Show
 
-instance FromJSON DeviceConfig where
+data DeviceConfig = DeviceConfig
+  { _deviceMount :: MountConfig
+  , _deviceData :: DataConfig
+  } deriving Show
+
+data TreeConfig = TreeConfig
+  { _treeParent :: DeviceConfig
+  , _treeChildren :: V.Vector String
+  } deriving Show
+
+instance FromJSON TreeConfig where
   parseJSON = withObject "devices" $ \o -> do
     devType <- o .: "type"
-    case (devType :: String) of
-      "cifs"      -> CIFSConfig
-        <$> o .: "mount"
-        <*> o .: "remote"
-        <*> o .:& "depends"
-        <*> o .:? "password"
-      "sshfs"     -> SSHFSConfig
-        <$> o .: "mount"
-        <*> o .: "remote"
-        <*> o .:& "depends"
-      "veracrypt" -> VeracryptConfig
-        <$> o .: "mount"
-        <*> o .: "volume"
-        <*> o .:& "depends"
-        <*> o .:? "password"
-      -- TODO make this skip adding an entry to the map rather than skipping the
-      -- map entirely
-      _           -> fail $ "unknown device type: " ++ devType
+    deps <- o .:& "depends"
+    mountconf <- o .: "mount"
+    devData <- case (devType :: String) of
+                 "cifs"      -> CIFSConfig
+                   <$> o .: "remote"
+                   <*> o .:? "password"
+                 "sshfs"     -> SSHFSConfig
+                   <$> o .: "remote"
+                 "veracrypt" -> VeracryptConfig
+                   <$> o .: "volume"
+                   <*> o .:? "password"
+                 -- TODO make this skip adding an entry to the map rather than
+                 -- skipping the map entirely
+                 _           -> fail $ "unknown device type: " ++ devType
+    return $ TreeConfig
+      { _treeParent = DeviceConfig
+                      { _deviceMount = mountconf
+                      , _deviceData = devData
+                      }
+      , _treeChildren = deps
+      }
 
 data StaticConfig = StaticConfig
   { _staticconfigTmpPath :: Maybe String
-  , _staticconfigDevices :: M.Map String DeviceConfig
+  , _staticconfigDevices :: M.Map String TreeConfig
   } deriving Show
 
 instance FromJSON StaticConfig where
@@ -195,7 +203,7 @@ instance FromJSON StaticConfig where
 data MountConf = MountConf
     { mountconfVolatilePath :: FilePath
     , mountconfRofiArgs     :: [String]
-    , mountconfStaticDevs   :: M.Map String DeviceConfig
+    , mountconfStaticDevs   :: M.Map String TreeConfig
     }
 
 instance RofiConf MountConf where
@@ -279,56 +287,46 @@ runPrompt gs = selectAction $ emptyMenu
 
 getGroups :: RofiIO MountConf [RofiGroup MountConf]
 getGroups = do
-  (cifsDevs, sshfsDevs, vcDevs) <- groupTriples
-    <$> (fromConfig =<< asks mountconfStaticDevs)
-  sequence
-    [ mkGroup "SSHFS Devices" sshfsDevs
-    , mkGroup "CIFS Devices" cifsDevs
-    , mkGroup "Veracrypt Devices" vcDevs
-    , mkGroup "Removable Devices"  =<< getRemovableDevices
-    , mkGroup "MTP Devices" =<< getMTPDevices
-    ]
+  staticDevs <- asks mountconfStaticDevs
+  staticActions <- mapM mkAction $ configToTree' staticDevs
+  removableActions <- mapM mkAction =<< getRemovableDevices
+  mtpActions <- mapM mkAction =<< getMTPDevices
+  return $ mapMaybe mkGroup
+    $ groupBy (\(hx, _, _) (hy, _, _) -> hx == hy)
+    $ sortBy (\(hx, _, _) (hy, _, _) -> compare hx hy)
+    $ staticActions ++ removableActions ++ mtpActions
 
 mountByAlias :: Bool -> String -> RofiIO MountConf ()
 mountByAlias unmountFlag alias = do
   static <- asks mountconfStaticDevs
-  volatilePath <- asks mountconfVolatilePath
-  forM_(M.lookup alias static) $ \d -> do
-    res <- configToDev volatilePath static d
-    case res of
-      First d'  -> mount' d'
-      Second d' -> mount' d'
-      Third d'  -> mount' d'
-  where
-    mount' :: Mountable a => a -> RofiIO MountConf ()
-    mount' = flip mount unmountFlag
+  mapM_ (`mount` unmountFlag) $ configToTree static <$> M.lookup alias static
 
-mkGroup :: Mountable d => String -> [d] -> RofiIO MountConf (RofiGroup MountConf)
-mkGroup header devs = sortGroup header <$> mapM mkAction devs
+mkGroup :: [(Header, String, RofiIO MountConf ())] -> Maybe (RofiGroup MountConf)
+mkGroup [] = Nothing
+mkGroup as = let ((Header title _, _, _):_) = as in
+  -- Just $ titledGroup title $ alignEntries $ toRofiActions $ fmap (\(_, e, a) -> (e, a)) as
+  Just $ titledGroup title $ toRofiActions $ fmap (\(_, e, a) -> (e, a)) as
 
-sortGroup :: String -> [(String, RofiIO MountConf ())] -> RofiGroup MountConf
-sortGroup header = titledGroup header . alignEntries . toRofiActions
-
-alignSep :: String
-alignSep = " | "
+-- alignSep :: String
+-- alignSep = " | "
 
 alignSepPre :: String
 alignSepPre = "@@@"
 
-alignEntries :: RofiActions c -> RofiActions c
-alignEntries = O.fromList . withKeys . O.assocs
-  where
-    withKeys as = let (ks, vs) = unzip as in zip (align ks) vs
-    align = fmap (intercalate alignSep)
-      . transpose
-      . mapToLast pad
-      . transpose
-      . fmap (splitOn alignSepPre)
-    pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
-    getMax = maximum . fmap length
-    mapToLast _ []     = []
-    mapToLast _ [x]    = [x]
-    mapToLast f (x:xs) = f x : mapToLast f xs
+-- alignEntries :: RofiActions c -> RofiActions c
+-- alignEntries = O.fromList . withKeys . O.assocs
+--   where
+--     withKeys as = let (ks, vs) = unzip as in zip (align ks) vs
+--     align = fmap (intercalate alignSep)
+--       . transpose
+--       . mapToLast pad
+--       . transpose
+--       . fmap (splitOn alignSepPre)
+--     pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
+--     getMax = maximum . fmap length
+--     mapToLast _ []     = []
+--     mapToLast _ [x]    = [x]
+--     mapToLast f (x:xs) = f x : mapToLast f xs
 
 --------------------------------------------------------------------------------
 -- | Removable devices
@@ -352,7 +350,12 @@ instance Mountable Removable where
 
   isMounted Removable { deviceSpec = d } = elem d <$> io curDeviceSpecs
 
+  getLabel Removable { label = l } = l
+
+instance Actionable Removable where
   fmtEntry Removable { deviceSpec = d, label = l } = l ++ alignSepPre ++ d
+
+  groupHeader _ = Header "Removable Devices" 3
 
 -- | Return list of possible rofi actions for removable devices
 -- A 'removable device' is defined as a hotplugged device with a filesystem as
@@ -373,94 +376,8 @@ getRemovableDevices = fromLines toDev . lines
     mk d l = Just $ Removable { deviceSpec = d, label = l }
 
 --------------------------------------------------------------------------------
--- | CIFS Devices
---
--- This wraps the Removable device (since it is removable) and also adds its
--- own mount options and passwords for authentication.
-
-data CIFS = CIFS Removable FilePath (Maybe PasswordGetter) Dependencies
-
-instance Show CIFS where
-  show (CIFS r f _ d) = unwords [show r, show f, "<Pwd>", show d]
-
-instance Mountable CIFS where
-  mount (CIFS Removable{ label = l } m getPwd deps) False = do
-    mountDependencies deps
-    bracketOnError_
-      (mkDirMaybe m)
-      (rmDirMaybe m)
-      $ io $ do
-      res <- case getPwd of
-        Just pwd -> do
-          p <- maybe [] (\p -> [("PASSWD", p)]) <$> pwd
-          readCmdEither' "mount" [m] "" p
-        Nothing -> readCmdEither "mount" [m] ""
-      notifyMounted (isRight res) False l
-
-  mount (CIFS Removable{ label = l } m _ _) True = umountNotify l m
-
-  allInstalled _ = io $ isJust <$> findExecutable "mount.cifs"
-
-  isMounted (CIFS _ dir _ _) = io $ isDirMounted dir
-
-  fmtEntry (CIFS r _ _ _) = fmtEntry r
-
---------------------------------------------------------------------------------
--- | SSHFS Devices
---
--- This wraps the Removable device (since it is removable) and also adds its
--- own mount options. If the path does not point to an aliased entry in the ssh
--- config that specifies the port, hostname, user, and identity file, these
--- need to be passed as mount options.
-
-data SSHFS = SSHFS Removable FilePath Dependencies deriving Show
-
-instance Mountable SSHFS where
-  mount (SSHFS Removable{ deviceSpec = d, label = l } m deps) False = do
-    mountDependencies deps
-    bracketOnError_
-      (mkDirMaybe m)
-      (rmDirMaybe m)
-      (io $ runMountNotify "sshfs" [d, m] l False)
-
-  mount (SSHFS Removable{ label = l } m _) True = umountNotify l m
-
-  allInstalled _ = fmap isJust $ io $ findExecutable "sshfs"
-
-  isMounted (SSHFS _ dir _) = io $ isDirMounted dir
-
-  fmtEntry (SSHFS r _ _) = fmtEntry r
-
---------------------------------------------------------------------------------
 -- | VeraCrypt Devices
 --
-
-data VeraCrypt = VeraCrypt Removable FilePath (Maybe PasswordGetter) Dependencies
-
-instance Show VeraCrypt where
-  show (VeraCrypt r f _ d) = unwords [show r, show f, show d]
-
-instance Mountable VeraCrypt where
-  mount (VeraCrypt Removable{ deviceSpec = s, label = l } m getPwd deps) False = do
-    mountDependencies deps
-    bracketOnError_ (mkDirMaybe m) (rmDirMaybe m) mountMaybe
-    where
-      mountMaybe = io $ maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) getPwd
-      runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
-      runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False l)
-        =<< runVeraCrypt stdin ([s, m] ++ args)
-      notifyFail = notify "dialog-error-symbolic" $
-        printf "Failed to get volume password for %s" l
-
-  mount (VeraCrypt Removable{ label = l } m _ _) True = io $ do
-    res <- runVeraCrypt "" ["-d", m]
-    notifyMounted (isRight res) True l
-
-  allInstalled _ = io $ isJust <$> findExecutable "veracrypt"
-
-  isMounted (VeraCrypt _ dir _ _) = io $ isDirMounted dir
-
-  fmtEntry (VeraCrypt r _ _ _) = fmtEntry r
 
 -- NOTE: the user is assumed to have added themselves to the sudoers file so
 -- that this command will work
@@ -502,7 +419,12 @@ instance Mountable MTPFS where
 
   isMounted MTPFS { mountpoint = dir } = io $ isDirMounted dir
 
+  getLabel = fmtEntry
+
+instance Actionable MTPFS where
   fmtEntry MTPFS { description = d } = d
+
+  groupHeader _ = Header "MTP Devices" 5
 
 -- | Return list of all available MTP devices
 getMTPDevices :: RofiIO MountConf [MTPFS]
@@ -536,72 +458,88 @@ getMTPDevices = do
 -- In order to make a consistent interface for the static device types, create
 -- a wrapper type to encapsulate them.
 
--- | a sum-type wrapper for three different types, obviously this will change
--- if/when I add more static devices and their types
-data Triple a b c = First a | Second b | Third c deriving Show
+data Tree a = Tree a [Tree a] deriving (Eq, Show)
 
--- | Specific wrapper for static devices
-type StaticDeviceTriple = Triple CIFS SSHFS VeraCrypt
+type StaticConfigTree = Tree DeviceConfig
 
-fromConfig :: M.Map String DeviceConfig -> RofiIO MountConf [StaticDeviceTriple]
-fromConfig st = do
-  p <- asks mountconfVolatilePath
-  mapM (configToDev p st) $ M.elems st
+instance Actionable (Tree DeviceConfig) where
+  fmtEntry (Tree p _) = getLabel p
 
--- TODO abstract parts of this away in new typeclass for static devices
-configToDev :: FilePath -> M.Map String DeviceConfig -> DeviceConfig
-  -> RofiIO MountConf StaticDeviceTriple
-configToDev v s CIFSConfig { _cifsMount = MountConfig { _mountMountPoint = m }
-                           , _cifsRemote = t
-                           , _cifsDepends = d
-                           , _cifsPassword = p } = do
-  -- stuff like this is totally refactorable
-  let r = Removable { deviceSpec = smartSlashPrefix t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ First $ CIFS r (appendRoot v m) (configToPwd <$> p) d'
+  groupHeader (Tree DeviceConfig{ _deviceData = d } _) =
+    case d of
+      CIFSConfig{} -> Header "CIFS Devices" 0
+      SSHFSConfig{} -> Header "SSHFS Devices" 1
+      VeracryptConfig{} -> Header "Veracrypt Devices" 2
+
+configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
+configToTree' devMap = configToTree devMap <$> M.elems devMap
+
+configToTree :: M.Map String TreeConfig -> TreeConfig -> StaticConfigTree
+configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
+  Tree p $ fmap go V.toList c
   where
-    smartSlashPrefix a = if "//" `isPrefixOf` a then a else "//" ++ a
-configToDev v s SSHFSConfig { _sshfsMount = MountConfig { _mountMountPoint = m }
-                            , _sshfsDepends = d
-                            , _sshfsRemote = t } = do
-  let r = Removable { deviceSpec = t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ Second $ SSHFS r (appendRoot v m) d'
-configToDev v s VeracryptConfig { _veracryptMount = MountConfig { _mountMountPoint = m }
-                                , _veracryptVolume = t
-                                , _veracryptDepends = d
-                                , _veracryptPassword = p } = do
-  let r = Removable { deviceSpec = t, label = takeFileName m }
-  d' <- getDependencies s $ V.toList d
-  return $ Third $ VeraCrypt r (appendRoot v m) (configToPwd <$> p) d'
+    go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
 
-groupTriples :: [Triple a b c] -> ([a], [b], [c])
-groupTriples = foldl stackTriples ([], [], [])
+instance Mountable a => Mountable (Tree a) where
+  mount (Tree p cs) False = mapM_ (`mount` False) cs >> mount p False
+  mount (Tree p _) True = mount p True
 
-stackTriples :: ([a], [b], [c]) -> Triple a b c -> ([a], [b], [c])
-stackTriples (c, v, s) (First x)  = (x:c, v, s)
-stackTriples (c, v, s) (Second x) = (c, x:v, s)
-stackTriples (c, v, s) (Third x) = (c, v, x:s)
+  isMounted (Tree p _) = isMounted p
 
---------------------------------------------------------------------------------
--- | Static Dependencies
---
--- Define a data structure that allows one device to depend on another.
+  allInstalled (Tree p cs) = do
+    res <- and <$> mapM allInstalled cs
+    if res then allInstalled p else return res
 
-newtype Dependencies = Dependencies [StaticDeviceTriple] deriving Show
+  getLabel (Tree p _) = getLabel p
 
-getDependencies :: M.Map String DeviceConfig -> [String] -> RofiIO MountConf Dependencies
-getDependencies devMap aliases = fmap Dependencies
-  $ fromConfig $ M.filterWithKey (\k _ -> k `elem` aliases) devMap
+instance Mountable DeviceConfig where
+  mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }
+                      , _deviceData = devData
+                      } False = do
+    mountRoot <- asks mountconfVolatilePath
+    let m' = appendRoot mountRoot m
+    bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
+    where
+      mount' mountpoint = io $ case devData of
+        SSHFSConfig{ _sshfsRemote = r } ->
+          runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
+        CIFSConfig{ _cifsPassword = p } -> do
+          res <- case p of
+            Just pwd -> do
+              pwd' <- maybe [] (\p' -> [("PASSWD", p')]) <$> configToPwd pwd
+              readCmdEither' "mount" [mountpoint] "" pwd'
+            Nothing -> readCmdEither "mount" [mountpoint] ""
+          notifyMounted (isRight res) False (getLabel c)
+        VeracryptConfig{ _veracryptPassword = getPwd, _veracryptVolume = v } ->
+          maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) (configToPwd <$> getPwd)
+          where
+            l = getLabel c
+            runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
+            runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False l)
+              =<< runVeraCrypt stdin ([v, mountpoint] ++ args)
+            notifyFail = notify "dialog-error-symbolic" $
+              printf "Failed to get volume password for %s" l
 
-mountDependencies :: Dependencies -> RofiIO MountConf ()
-mountDependencies (Dependencies d) = mapM_ mount' d
-  where
-    -- this looks stupid but all these mount calls are technically different
-    -- functions because class instances
-    mount' (First m) = mount m False
-    mount' (Second m) = mount m False
-    mount' (Third m) = mount m False
+  mount c@DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }
+                      , _deviceData = VeracryptConfig{}
+                      } True = io $ do
+    res <- runVeraCrypt "" ["-d", m]
+    notifyMounted (isRight res) True (getLabel c)
+  
+  mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }} True =
+    umountNotify (getLabel c) m
+
+  allInstalled DeviceConfig{ _deviceData = devData } = io $ isJust
+    <$> findExecutable (exe devData)
+    where
+      exe SSHFSConfig{} = "sshfs"
+      exe CIFSConfig{} = "mount.cifs"
+      exe VeracryptConfig{} = "veracrypt"
+
+  isMounted DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }} = io $ isDirMounted m
+
+  getLabel DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = p, _mountLabel = l }} =
+    fromMaybe (takeBaseName p) l
 
 --------------------------------------------------------------------------------
 -- | Mountable typeclass
@@ -616,24 +554,44 @@ class Mountable a where
   -- | Mount the given type (or dismount if False is passed)
   mount :: a -> Bool -> RofiIO MountConf ()
 
+  mountMaybe :: a -> Bool -> RofiIO MountConf ()
+  mountMaybe dev mountFlag = do
+    mounted <- isMounted dev
+    if mountFlag == mounted then mount dev mountFlag
+      else io $ notify "dialog-information-symbolic"
+           $ getLabel dev ++ " already mounted"
+
   -- | Check if the mounting utilities are present
   allInstalled :: a -> RofiIO MountConf Bool
 
-  -- | Return a string to go in the Rofi menu for the given type
-  fmtEntry :: a -> String
+  -- | Return a string representing the label of the device
+  getLabel :: a -> String
 
   -- | Determine if the given type is mounted or not
   isMounted :: a -> RofiIO MountConf Bool
 
+data Header = Header String Integer deriving (Show, Eq)
+
+instance Ord Header where
+  compare (Header _ x) (Header _ y) = compare x y
+
+class Mountable a => Actionable a where
+  -- | Return a string to go in the Rofi menu for the given type
+  fmtEntry :: a -> String
+  fmtEntry = getLabel
+
+  groupHeader :: a -> Header
+
   -- | Given a mountable type, return a rofi action (string to go in the
   -- Rofi prompt and an action to perform when it is selected)
-  mkAction :: a -> RofiIO MountConf (String, RofiIO MountConf ())
+  mkAction :: a -> RofiIO MountConf (Header, String, RofiIO MountConf ())
   mkAction dev = do
     m <- isMounted dev
     i <- allInstalled dev
-    let a = when i $ mount dev m
+    let h = groupHeader dev
+    let a = when i $ mountMaybe dev m
     let s = mountedPrefix m i ++ fmtEntry dev
-    return (s, a)
+    return (h, s, a)
     where
       mountedPrefix False True = "  "
       mountedPrefix True True  = "* "
