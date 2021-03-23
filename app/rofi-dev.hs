@@ -20,7 +20,6 @@ import           Data.Either
 import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
--- import qualified Data.Map.Ordered      as O
 import           Data.Maybe
 import qualified Data.Text as T
 import qualified Data.Vector as V
@@ -292,8 +291,8 @@ getGroups = do
   removableActions <- mapM mkAction =<< getRemovableDevices
   mtpActions <- mapM mkAction =<< getMTPDevices
   return $ mapMaybe mkGroup
-    $ groupBy (\(hx, _, _) (hy, _, _) -> hx == hy)
-    $ sortBy (\(hx, _, _) (hy, _, _) -> compare hx hy)
+    $ groupBy (\(hx, _) (hy, _) -> hx == hy)
+    $ sortBy (\(hx, _) (hy, _) -> compare hx hy)
     $ staticActions ++ removableActions ++ mtpActions
 
 mountByAlias :: Bool -> String -> RofiIO MountConf ()
@@ -301,32 +300,29 @@ mountByAlias unmountFlag alias = do
   static <- asks mountconfStaticDevs
   mapM_ (`mount` unmountFlag) $ configToTree static <$> M.lookup alias static
 
-mkGroup :: [(Header, String, RofiIO MountConf ())] -> Maybe (RofiGroup MountConf)
+mkGroup :: [(Header, ProtoAction [String])] -> Maybe (RofiGroup MountConf)
 mkGroup [] = Nothing
-mkGroup as = let ((Header title _, _, _):_) = as in
-  -- Just $ titledGroup title $ alignEntries $ toRofiActions $ fmap (\(_, e, a) -> (e, a)) as
-  Just $ titledGroup title $ toRofiActions $ fmap (\(_, e, a) -> (e, a)) as
+mkGroup as = let ((Header title _, _):_) = as in
+  Just $ titledGroup title $ toRofiActions $ alignEntries $ fmap snd as
 
--- alignSep :: String
--- alignSep = " | "
+alignSep :: String
+alignSep = " | "
 
-alignSepPre :: String
-alignSepPre = "@@@"
-
--- alignEntries :: RofiActions c -> RofiActions c
--- alignEntries = O.fromList . withKeys . O.assocs
---   where
---     withKeys as = let (ks, vs) = unzip as in zip (align ks) vs
---     align = fmap (intercalate alignSep)
---       . transpose
---       . mapToLast pad
---       . transpose
---       . fmap (splitOn alignSepPre)
---     pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
---     getMax = maximum . fmap length
---     mapToLast _ []     = []
---     mapToLast _ [x]    = [x]
---     mapToLast f (x:xs) = f x : mapToLast f xs
+alignEntries :: [ProtoAction [String]] -> [(String, RofiIO MountConf ())]
+alignEntries = withEntries
+  where
+    withEntries as = let entries = fmap (\(ProtoAction e _) -> e) as in
+      zipWith (\e (ProtoAction _ a) -> (e, a)) (align entries) as
+    align = fmap (intercalate alignSep)
+      . transpose
+      . mapToLast pad
+      . transpose
+      -- . fmap (splitOn alignSepPre)
+    pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
+    getMax = maximum . fmap length
+    mapToLast _ []     = []
+    mapToLast _ [x]    = [x]
+    mapToLast f (x:xs) = f x : mapToLast f xs
 
 --------------------------------------------------------------------------------
 -- | Removable devices
@@ -353,7 +349,7 @@ instance Mountable Removable where
   getLabel Removable { label = l } = l
 
 instance Actionable Removable where
-  fmtEntry Removable { deviceSpec = d, label = l } = l ++ alignSepPre ++ d
+  fmtEntry Removable { deviceSpec = d, label = l } = [l, d]
 
   groupHeader _ = Header "Removable Devices" 3
 
@@ -419,10 +415,10 @@ instance Mountable MTPFS where
 
   isMounted MTPFS { mountpoint = dir } = io $ isDirMounted dir
 
-  getLabel = fmtEntry
+  getLabel MTPFS { description = d } = d
 
 instance Actionable MTPFS where
-  fmtEntry MTPFS { description = d } = d
+  fmtEntry d = [getLabel d]
 
   groupHeader _ = Header "MTP Devices" 5
 
@@ -463,7 +459,11 @@ data Tree a = Tree a [Tree a] deriving (Eq, Show)
 type StaticConfigTree = Tree DeviceConfig
 
 instance Actionable (Tree DeviceConfig) where
-  fmtEntry (Tree p _) = getLabel p
+  fmtEntry (Tree p@DeviceConfig{ _deviceData = d } _) = [getLabel p, target d] 
+    where
+      target CIFSConfig{ _cifsRemote = r } = r
+      target SSHFSConfig{ _sshfsRemote = r } = r
+      target VeracryptConfig{ _veracryptVolume = v } = v
 
   groupHeader (Tree DeviceConfig{ _deviceData = d } _) =
     case d of
@@ -481,7 +481,7 @@ configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
     go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
 
 instance Mountable a => Mountable (Tree a) where
-  mount (Tree p cs) False = mapM_ (`mount` False) cs >> mount p False
+  mount (Tree p cs) False = mapM_ (`mountMaybe` False) cs >> mount p False
   mount (Tree p _) True = mount p True
 
   isMounted (Tree p _) = isMounted p
@@ -496,12 +496,11 @@ instance Mountable DeviceConfig where
   mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }
                       , _deviceData = devData
                       } False = do
-    mountRoot <- asks mountconfVolatilePath
-    let m' = appendRoot mountRoot m
+    m' <- getAbsMountpoint m
     bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
     where
       mount' mountpoint = io $ case devData of
-        SSHFSConfig{ _sshfsRemote = r } ->
+        SSHFSConfig{ _sshfsRemote = r } -> do
           runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
         CIFSConfig{ _cifsPassword = p } -> do
           res <- case p of
@@ -521,13 +520,13 @@ instance Mountable DeviceConfig where
               printf "Failed to get volume password for %s" l
 
   mount c@DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }
-                      , _deviceData = VeracryptConfig{}
-                      } True = io $ do
-    res <- runVeraCrypt "" ["-d", m]
-    notifyMounted (isRight res) True (getLabel c)
+                      , _deviceData = VeracryptConfig{} } True = do
+    m' <- getAbsMountpoint m
+    res <- io $ runVeraCrypt "" ["-d", m']
+    io $ notifyMounted (isRight res) True (getLabel c)
   
   mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }} True =
-    umountNotify (getLabel c) m
+    umountNotify (getLabel c) =<< getAbsMountpoint m
 
   allInstalled DeviceConfig{ _deviceData = devData } = io $ isJust
     <$> findExecutable (exe devData)
@@ -536,10 +535,14 @@ instance Mountable DeviceConfig where
       exe CIFSConfig{} = "mount.cifs"
       exe VeracryptConfig{} = "veracrypt"
 
-  isMounted DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }} = io $ isDirMounted m
+  isMounted DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }} =
+    (io . isDirMounted) =<< getAbsMountpoint m
 
   getLabel DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = p, _mountLabel = l }} =
-    fromMaybe (takeBaseName p) l
+    fromMaybe (takeFileName p) l
+
+getAbsMountpoint :: FilePath -> RofiIO MountConf FilePath
+getAbsMountpoint p = asks $ flip appendRoot p . mountconfVolatilePath
 
 --------------------------------------------------------------------------------
 -- | Mountable typeclass
@@ -572,26 +575,30 @@ class Mountable a where
 
 data Header = Header String Integer deriving (Show, Eq)
 
+data ProtoAction a = ProtoAction a (RofiIO MountConf ())
+
 instance Ord Header where
   compare (Header _ x) (Header _ y) = compare x y
 
 class Mountable a => Actionable a where
   -- | Return a string to go in the Rofi menu for the given type
-  fmtEntry :: a -> String
-  fmtEntry = getLabel
+  fmtEntry :: a -> [String]
+  fmtEntry d = [getLabel d]
 
   groupHeader :: a -> Header
 
   -- | Given a mountable type, return a rofi action (string to go in the
   -- Rofi prompt and an action to perform when it is selected)
-  mkAction :: a -> RofiIO MountConf (Header, String, RofiIO MountConf ())
+  mkAction :: a -> RofiIO MountConf (Header, ProtoAction [String])
   mkAction dev = do
     m <- isMounted dev
     i <- allInstalled dev
     let h = groupHeader dev
-    let a = when i $ mountMaybe dev m
-    let s = mountedPrefix m i ++ fmtEntry dev
-    return (h, s, a)
+    let action = when i $ mountMaybe dev m
+    let entry = case fmtEntry dev of
+              (e:es) -> (mountedPrefix m i ++ e):es
+              _      -> []
+    return (h, ProtoAction entry action)
     where
       mountedPrefix False True = "  "
       mountedPrefix True True  = "* "
