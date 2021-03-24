@@ -487,24 +487,19 @@ runPromptLoop n pwd = do
     else return res
 
 configToPwd :: PasswordConfig -> PasswordGetter
-configToPwd PasswordConfig{ _passwordBitwarden = b
-                          , _passwordLibSecret = s
-                          , _passwordPrompt = p
-                          } =
+configToPwd PasswordConfig
+  { _passwordBitwarden = b
+  , _passwordLibSecret = s
+  , _passwordPrompt = p
+  } =
     getBW b `runMaybe` getLS s `runMaybe` getPrompt p
   where
     getBW (Just BitwardenConfig{ _bitwardenKey = k, _bitwardenTries = n }) =
       runPromptLoop n $ runBitwarden k
     getBW _ = return Nothing
-    getLS (Just LibSecretConfig{ _libsecretAttributes = a }) =
-      runSecret $ M.toList a
-    getLS _ = return Nothing
-    getPrompt (Just PromptConfig{ _promptTries = n }) =
-      runPromptLoop n readPassword
-    getPrompt _ = return Nothing
-    runMaybe x y = do
-      res <- x
-      if isNothing res then y else return res
+    getLS = maybe (return Nothing) (runSecret . M.toList . _libsecretAttributes)
+    getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . _promptTries)
+    runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
 
 --------------------------------------------------------------------------------
 -- | Removable devices
