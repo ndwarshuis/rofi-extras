@@ -181,12 +181,14 @@ instance FromJSON TreeConfig where
 
 data StaticConfig = StaticConfig
   { _staticconfigTmpPath :: Maybe String
+  , _staticconfigVerbose :: Maybe Bool
   , _staticconfigDevices :: M.Map String TreeConfig
   } deriving Show
 
 instance FromJSON StaticConfig where
   parseJSON = withObject "devices" $ \o -> StaticConfig
     <$> o .:? "mountdir"
+    <*> o .:? "verbose"
     <*> o .: "devices"
 
 --------------------------------------------------------------------------------
@@ -203,6 +205,7 @@ data MountConf = MountConf
     { mountconfVolatilePath :: FilePath
     , mountconfRofiArgs     :: [String]
     , mountconfStaticDevs   :: M.Map String TreeConfig
+    , mountconfVerbose      :: Bool
     }
 
 instance RofiConf MountConf where
@@ -260,12 +263,14 @@ runMounts :: Opts -> IO ()
 runMounts opts = do
   static <- join <$> traverse parseStaticConfig (optsConfig opts)
   defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
-  let tmpPath = fromMaybe defaultTmpPath (_staticconfigTmpPath =<< static)
+  let tmpPath = fromMaybe defaultTmpPath $ _staticconfigTmpPath =<< static
   let staticDevs = maybe M.empty _staticconfigDevices static
+  let verbose = fromMaybe False $ _staticconfigVerbose =<< static
   let mountconf = MountConf
         { mountconfVolatilePath = tmpPath
         , mountconfRofiArgs = optsRofiArgs opts
         , mountconfStaticDevs = staticDevs
+        , mountconfVerbose = verbose
         }
   let byAlias = mountByAlias $ optsUnmount opts
   let byPrompt = runPrompt =<< getGroups
@@ -558,9 +563,12 @@ class Mountable a where
   mountMaybe :: a -> Bool -> RofiIO MountConf ()
   mountMaybe dev mountFlag = do
     mounted <- isMounted dev
+    verbose <- asks mountconfVerbose
     if mountFlag == mounted then mount dev mountFlag
-      else io $ notify "dialog-information-symbolic"
-           $ getLabel dev ++ " already mounted"
+      else when verbose notify'
+    where
+      notify' = io $ notify "dialog-information-symbolic"
+                $ getLabel dev ++ " already mounted"
 
   -- | Check if the mounting utilities are present
   allInstalled :: a -> RofiIO MountConf Bool
