@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards   #-}
 {-# LANGUAGE FlexibleInstances #-}
 
 --------------------------------------------------------------------------------
@@ -84,9 +83,9 @@ runMounts :: Opts -> IO ()
 runMounts opts = do
   static <- join <$> traverse parseStaticConfig (optsConfig opts)
   defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
-  let tmpPath = fromMaybe defaultTmpPath $ _staticconfigTmpPath =<< static
-  let staticDevs = maybe M.empty _staticconfigDevices static
-  let verbose = fromMaybe False $ _staticconfigVerbose =<< static
+  let tmpPath = fromMaybe defaultTmpPath $ staticconfigTmpPath =<< static
+  let staticDevs = maybe M.empty staticconfigDevices static
+  let verbose = fromMaybe False $ staticconfigVerbose =<< static
   let mountconf = MountConf
         { mountconfVolatilePath = tmpPath
         , mountconfRofiArgs = optsRofiArgs opts
@@ -128,8 +127,8 @@ mountByAlias unmountFlag alias = do
 
 mkGroup :: [(Header, ProtoAction [String])] -> Maybe (RofiGroup MountConf)
 mkGroup [] = Nothing
-mkGroup as = let ((Header title _, _):_) = as in
-  Just $ titledGroup title $ toRofiActions $ alignEntries $ fmap snd as
+mkGroup as = let ((h, _):_) = as in
+  Just $ titledGroup (show h) $ toRofiActions $ alignEntries $ fmap snd as
 
 alignSep :: String
 alignSep = " | "
@@ -224,12 +223,28 @@ class Mountable a => Actionable a where
 
 type RofiMountIO a = RofiIO MountConf a
 
-data Header = Header String Integer deriving (Show, Eq)
+-- headers appear in the order listed here (per Enum)
+data Header = CIFSHeader
+  | SSHFSHeader
+  | VeracryptHeader
+  | RemovableHeader
+  | MTPFSHeader
+  deriving (Enum, Eq)
+
+instance Show Header where
+  show h = case h of
+    CIFSHeader      -> suffix "CIFS"
+    SSHFSHeader     -> suffix "SSHFS"
+    VeracryptHeader -> suffix "Veracrypt"
+    RemovableHeader -> suffix "Removable"
+    MTPFSHeader     -> suffix "MTPFS"
+    where
+      suffix = (++ " Devices")
 
 data ProtoAction a = ProtoAction a (RofiMountIO ())
 
 instance Ord Header where
-  compare (Header _ x) (Header _ y) = compare x y
+  compare x y = compare (fromEnum x) (fromEnum y)
 
 --------------------------------------------------------------------------------
 -- | Static device configuration
@@ -244,18 +259,18 @@ defaultTries = 2
 (.:&) o t = o .:? t .!= V.empty
 
 data MountConfig = MountConfig
-  { _mountMountPoint :: FilePath
-  , _mountLabel :: Maybe String
+  { mountMountpoint :: FilePath
+  , mountLabel :: Maybe String
   } deriving Show
 
 instance FromJSON MountConfig where
-  parseJSON = withObject "devices" $ \o -> MountConfig
+  parseJSON = withObject "mount" $ \o -> MountConfig
     <$> o .: "mountpoint"
     <*> o .:? "label"
 
 data BitwardenConfig = BitwardenConfig
-  { _bitwardenKey :: String
-  , _bitwardenTries :: Integer }
+  { bitwardenKey :: String
+  , bitwardenTries :: Integer }
   deriving Show
 
 instance FromJSON BitwardenConfig where
@@ -264,7 +279,7 @@ instance FromJSON BitwardenConfig where
     <*> o .:? "tries" .!= defaultTries
 
 newtype LibSecretConfig = LibSecretConfig
-  { _libsecretAttributes :: M.Map String String }
+  { libsecretAttributes :: M.Map String String }
   deriving Show
 
 instance FromJSON LibSecretConfig where
@@ -272,7 +287,7 @@ instance FromJSON LibSecretConfig where
     <$> o .: "attributes"
 
 newtype PromptConfig = PromptConfig
-  { _promptTries :: Integer }
+  { promptTries :: Integer }
   deriving Show
 
 instance FromJSON PromptConfig where
@@ -280,9 +295,9 @@ instance FromJSON PromptConfig where
     <$> o .: "tries" .!= defaultTries
 
 data PasswordConfig = PasswordConfig
-  { _passwordBitwarden :: Maybe BitwardenConfig
-  , _passwordLibSecret :: Maybe LibSecretConfig
-  , _passwordPrompt :: Maybe PromptConfig
+  { passwordBitwarden :: Maybe BitwardenConfig
+  , passwordLibSecret :: Maybe LibSecretConfig
+  , passwordPrompt :: Maybe PromptConfig
   }
   deriving Show
 
@@ -293,23 +308,23 @@ instance FromJSON PasswordConfig where
     <*> o .:? "prompt"
 
 data DataConfig = VeracryptConfig
-  { _veracryptVolume :: String
-  , _veracryptPassword :: Maybe PasswordConfig
+  { veracryptVolume :: String
+  , veracryptPassword :: Maybe PasswordConfig
   } | SSHFSConfig
-  { _sshfsRemote :: String
+  { sshfsRemote :: String
   } | CIFSConfig
-  { _cifsRemote :: String
-  , _cifsPassword :: Maybe PasswordConfig
+  { cifsRemote :: String
+  , cifsPassword :: Maybe PasswordConfig
   } deriving Show
 
 data DeviceConfig = DeviceConfig
-  { _deviceMount :: MountConfig
-  , _deviceData :: DataConfig
+  { deviceMount :: MountConfig
+  , deviceData :: DataConfig
   } deriving Show
 
 data TreeConfig = TreeConfig
-  { _treeParent :: DeviceConfig
-  , _treeChildren :: V.Vector String
+  { treeParent :: DeviceConfig
+  , treeconfigChildren :: V.Vector String
   } deriving Show
 
 instance FromJSON TreeConfig where
@@ -330,17 +345,17 @@ instance FromJSON TreeConfig where
                  -- skipping the map entirely
                  _           -> fail $ "unknown device type: " ++ devType
     return $ TreeConfig
-      { _treeParent = DeviceConfig
-                      { _deviceMount = mountconf
-                      , _deviceData = devData
+      { treeParent = DeviceConfig
+                      { deviceMount = mountconf
+                      , deviceData = devData
                       }
-      , _treeChildren = deps
+      , treeconfigChildren = deps
       }
 
 data StaticConfig = StaticConfig
-  { _staticconfigTmpPath :: Maybe String
-  , _staticconfigVerbose :: Maybe Bool
-  , _staticconfigDevices :: M.Map String TreeConfig
+  { staticconfigTmpPath :: Maybe String
+  , staticconfigVerbose :: Maybe Bool
+  , staticconfigDevices :: M.Map String TreeConfig
   } deriving Show
 
 instance FromJSON StaticConfig where
@@ -375,23 +390,23 @@ instance Mountable a => Mountable (Tree a) where
   getLabel (Tree p _) = getLabel p
 
 instance Actionable (Tree DeviceConfig) where
-  fmtEntry (Tree p@DeviceConfig{ _deviceData = d } _) = [getLabel p, target d] 
+  fmtEntry (Tree p@DeviceConfig{ deviceData = d } _) = [getLabel p, target d] 
     where
-      target CIFSConfig{ _cifsRemote = r } = r
-      target SSHFSConfig{ _sshfsRemote = r } = r
-      target VeracryptConfig{ _veracryptVolume = v } = v
+      target CIFSConfig{ cifsRemote = r } = r
+      target SSHFSConfig{ sshfsRemote = r } = r
+      target VeracryptConfig{ veracryptVolume = v } = v
 
-  groupHeader (Tree DeviceConfig{ _deviceData = d } _) =
+  groupHeader (Tree DeviceConfig{ deviceData = d } _) =
     case d of
-      CIFSConfig{} -> Header "CIFS Devices" 0
-      SSHFSConfig{} -> Header "SSHFS Devices" 1
-      VeracryptConfig{} -> Header "Veracrypt Devices" 2
+      CIFSConfig{} -> CIFSHeader
+      SSHFSConfig{} -> SSHFSHeader
+      VeracryptConfig{} -> VeracryptHeader
 
 configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
 configToTree' devMap = configToTree devMap <$> M.elems devMap
 
 configToTree :: M.Map String TreeConfig -> TreeConfig -> StaticConfigTree
-configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
+configToTree devMap TreeConfig{ treeParent = p, treeconfigChildren = c } =
   Tree p $ fmap go V.toList c
   where
     go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
@@ -407,21 +422,21 @@ configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
 -- outside of these needs to be aware of these different classes.
 
 instance Mountable DeviceConfig where
-  mount c@DeviceConfig{ _deviceMount = m, _deviceData = devData} False = do
+  mount c@DeviceConfig{ deviceMount = m, deviceData = devData} False = do
     m' <- getAbsMountpoint m
     bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
     where
       mount' mountpoint = io $ case devData of
-        SSHFSConfig{ _sshfsRemote = r } -> do
+        SSHFSConfig{ sshfsRemote = r } -> do
           runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
-        CIFSConfig{ _cifsPassword = p } -> do
+        CIFSConfig{ cifsPassword = p } -> do
           res <- case p of
             Just pwd -> do
               pwd' <- maybe [] (\p' -> [("PASSWD", p')]) <$> configToPwd pwd
               readCmdEither' "mount" [mountpoint] "" pwd'
             Nothing -> readCmdEither "mount" [mountpoint] ""
           notifyMounted (isRight res) False (getLabel c)
-        VeracryptConfig{ _veracryptPassword = getPwd, _veracryptVolume = v } ->
+        VeracryptConfig{ veracryptPassword = getPwd, veracryptVolume = v } ->
           maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) (configToPwd <$> getPwd)
           where
             label = getLabel c
@@ -431,30 +446,30 @@ instance Mountable DeviceConfig where
             notifyFail = notify "dialog-error-symbolic" $
               printf "Failed to get volume password for %s" label
 
-  mount c@DeviceConfig{ _deviceMount = m, _deviceData = VeracryptConfig{} } True = do
+  mount c@DeviceConfig{ deviceMount = m, deviceData = VeracryptConfig{} } True = do
     m' <- getAbsMountpoint m
     res <- io $ runVeraCrypt "" ["-d", m']
     io $ notifyMounted (isRight res) True (getLabel c)
   
-  mount c@DeviceConfig{ _deviceMount = m } True =
+  mount c@DeviceConfig{ deviceMount = m } True =
     umountNotify (getLabel c) =<< getAbsMountpoint m
 
-  allInstalled DeviceConfig{ _deviceData = devData } = io $ isJust
+  allInstalled DeviceConfig{ deviceData = devData } = io $ isJust
     <$> findExecutable (exe devData)
     where
       exe SSHFSConfig{} = "sshfs"
       exe CIFSConfig{} = "mount.cifs"
       exe VeracryptConfig{} = "veracrypt"
 
-  isMounted DeviceConfig{ _deviceMount = m } =
+  isMounted DeviceConfig{ deviceMount = m } =
     (io . isDirMounted) =<< getAbsMountpoint m
 
   getLabel DeviceConfig
-    { _deviceMount = MountConfig { _mountMountPoint = p, _mountLabel = l }
+    { deviceMount = MountConfig { mountMountpoint = p, mountLabel = l }
     } = fromMaybe (takeFileName p) l
 
 getAbsMountpoint :: MountConfig -> RofiMountIO FilePath
-getAbsMountpoint MountConfig{ _mountMountPoint = m } =
+getAbsMountpoint MountConfig{ mountMountpoint = m } =
   asks $ flip appendRoot m . mountconfVolatilePath
 
 -- NOTE: the user is assumed to have added themselves to the sudoers file so
@@ -470,10 +485,10 @@ runVeraCrypt stdin args = do
 
 type PasswordGetter = IO (Maybe String)
 
-runSecret :: [(String, String)] -> PasswordGetter
+runSecret :: M.Map String String -> PasswordGetter
 runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
-    kvs' = concatMap (\(k, v) -> [k, v]) kvs
+    kvs' = concatMap (\(k, v) -> [k, v]) $ M.toList kvs 
 
 runBitwarden :: String -> PasswordGetter
 runBitwarden pname = ((password . login) <=< find (\i -> name i == pname))
@@ -488,17 +503,17 @@ runPromptLoop n pwd = do
 
 configToPwd :: PasswordConfig -> PasswordGetter
 configToPwd PasswordConfig
-  { _passwordBitwarden = b
-  , _passwordLibSecret = s
-  , _passwordPrompt = p
+  { passwordBitwarden = b
+  , passwordLibSecret = s
+  , passwordPrompt = p
   } =
     getBW b `runMaybe` getLS s `runMaybe` getPrompt p
   where
-    getBW (Just BitwardenConfig{ _bitwardenKey = k, _bitwardenTries = n }) =
+    getBW (Just BitwardenConfig{ bitwardenKey = k, bitwardenTries = n }) =
       runPromptLoop n $ runBitwarden k
     getBW _ = return Nothing
-    getLS = maybe (return Nothing) (runSecret . M.toList . _libsecretAttributes)
-    getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . _promptTries)
+    getLS = maybe (return Nothing) (runSecret . libsecretAttributes)
+    getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . promptTries)
     runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
 
 --------------------------------------------------------------------------------
@@ -509,27 +524,27 @@ configToPwd PasswordConfig
 -- addresses (eg in /dev) and labels.
 
 data Removable = Removable
-    { deviceSpec :: String
-    , label      :: String
+    { removablePath :: String
+    , removableLabel      :: String
     }
     deriving (Eq, Show)
 
 instance Mountable Removable where
-  mount Removable { deviceSpec = d, label = l } m =
+  mount Removable { removablePath = d, removableLabel = l } m =
     io $ runMountNotify "udisksctl" [c, "-b", d] l m
     where
       c = if m then "unmount" else "mount"
 
   allInstalled _ = fmap isJust $ io $ findExecutable "udisksctl"
 
-  isMounted Removable { deviceSpec = d } = elem d <$> io curDeviceSpecs
+  isMounted Removable { removablePath = d } = elem d <$> io curDeviceSpecs
 
-  getLabel Removable { label = l } = l
+  getLabel Removable { removableLabel = l } = l
 
 instance Actionable Removable where
-  fmtEntry Removable { deviceSpec = d, label = l } = [l, d]
+  fmtEntry Removable { removablePath = d, removableLabel = l } = [l, d]
 
-  groupHeader _ = Header "Removable Devices" 3
+  groupHeader _ = RemovableHeader
 
 -- | Return list of possible rofi actions for removable devices
 -- A 'removable device' is defined as a hotplugged device with a filesystem as
@@ -547,36 +562,40 @@ getRemovableDevices = fromLines toDev . lines
       [_, "1", d, "", s] -> mk d $ s ++ " Volume"
       [_, "1", d, l, _]  -> mk d l
       _                  -> Nothing
-    mk d l = Just $ Removable { deviceSpec = d, label = l }
+    mk d l = Just $ Removable { removablePath = d, removableLabel = l }
 
 --------------------------------------------------------------------------------
 -- | MTP devices
 
 data MTPFS = MTPFS
-    { bus         :: String
-    , device      :: String
-    , mountpoint  :: FilePath
-    , description :: String
+    { mtpfsBus         :: String
+    , mtpfsDevice      :: String
+    , mtpfsMountpoint  :: FilePath
+    , mtpfsDescription :: String
     }
     deriving (Eq, Show)
 
 instance Mountable MTPFS where
-  mount MTPFS {..} False = do
+  mount MTPFS { mtpfsBus = b
+              , mtpfsDevice = n
+              , mtpfsMountpoint = m
+              , mtpfsDescription = d
+              } False = do
     -- TODO add autodismount to options
-    let dev = "-device=" ++ bus ++ "," ++ device
+    let dev = "-device=" ++ b ++ "," ++ n
     bracketOnError_
-      (mkDirMaybe mountpoint)
-      (rmDirMaybe mountpoint)
-      (io $ runMountNotify "jmtpfs" [dev, mountpoint] description False)
+      (mkDirMaybe m)
+      (rmDirMaybe m)
+      $ io $ runMountNotify "jmtpfs" [dev, m] d False
 
-  mount MTPFS { mountpoint = m, description = d } True = umountNotify d m
+  mount MTPFS { mtpfsMountpoint = m, mtpfsDescription = d } True = umountNotify d m
 
   -- | return True always since the list won't even show without jmtpfs
   allInstalled _ = return True
 
-  isMounted MTPFS { mountpoint = dir } = io $ isDirMounted dir
+  isMounted = io . isDirMounted <$> mtpfsMountpoint
 
-  getLabel MTPFS { description = d } = d
+  getLabel = mtpfsDescription
 
 -- | Return list of all available MTP devices
 getMTPDevices :: RofiMountIO [MTPFS]
@@ -592,10 +611,10 @@ getMTPDevices = do
     toDev dir s = case splitOn ", " s of
       [busNum, devNum, _, _, desc, vendor] -> let d = unwords [vendor, desc]
         in Just $ MTPFS
-           { bus = busNum
-           , device = devNum
-           , mountpoint = dir </> canonicalize d
-           , description = d
+           { mtpfsBus = busNum
+           , mtpfsDevice = devNum
+           , mtpfsMountpoint = dir </> canonicalize d
+           , mtpfsDescription = d
            }
       _ -> Nothing
     canonicalize = mapMaybe repl
@@ -607,7 +626,7 @@ getMTPDevices = do
 instance Actionable MTPFS where
   fmtEntry d = [getLabel d]
 
-  groupHeader _ = Header "MTP Devices" 5
+  groupHeader _ = MTPFSHeader
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
