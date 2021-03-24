@@ -298,7 +298,7 @@ getGroups = do
 mountByAlias :: Bool -> String -> RofiIO MountConf ()
 mountByAlias unmountFlag alias = do
   static <- asks mountconfStaticDevs
-  mapM_ (`mount` unmountFlag) $ configToTree static <$> M.lookup alias static
+  mapM_ (`mountMaybe` unmountFlag) $ configToTree static <$> M.lookup alias static
 
 mkGroup :: [(Header, ProtoAction [String])] -> Maybe (RofiGroup MountConf)
 mkGroup [] = Nothing
@@ -309,15 +309,13 @@ alignSep :: String
 alignSep = " | "
 
 alignEntries :: [ProtoAction [String]] -> [(String, RofiIO MountConf ())]
-alignEntries = withEntries
+alignEntries ps = zip (align es) as
   where
-    withEntries as = let entries = fmap (\(ProtoAction e _) -> e) as in
-      zipWith (\e (ProtoAction _ a) -> (e, a)) (align entries) as
+    (es, as) = unzip $ fmap (\(ProtoAction e a) -> (e, a)) ps
     align = fmap (intercalate alignSep)
       . transpose
       . mapToLast pad
       . transpose
-      -- . fmap (splitOn alignSepPre)
     pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
     getMax = maximum . fmap length
     mapToLast _ []     = []
