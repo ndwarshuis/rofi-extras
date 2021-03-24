@@ -74,10 +74,168 @@ data Opts = Opts
   } deriving Show
 
 --------------------------------------------------------------------------------
--- | Static configuration
+-- | Main prompt
 --
--- This is defined in a YAML file which describes how to mount each device. Here
--- I define a parser for said YAML file
+-- This command will have one Rofi prompt and will display all available
+-- mounts grouped by device type (eg removable, sshfs, cifs, etc). I like
+-- pretty things, so ensure the entries are aligned properly as well
+
+runMounts :: Opts -> IO ()
+runMounts opts = do
+  static <- join <$> traverse parseStaticConfig (optsConfig opts)
+  defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
+  let tmpPath = fromMaybe defaultTmpPath $ _staticconfigTmpPath =<< static
+  let staticDevs = maybe M.empty _staticconfigDevices static
+  let verbose = fromMaybe False $ _staticconfigVerbose =<< static
+  let mountconf = MountConf
+        { mountconfVolatilePath = tmpPath
+        , mountconfRofiArgs = optsRofiArgs opts
+        , mountconfStaticDevs = staticDevs
+        , mountconfVerbose = verbose
+        }
+  let byAlias = mountByAlias $ optsUnmount opts
+  let byPrompt = runPrompt =<< getGroups
+  runRofiIO mountconf $ maybe byPrompt byAlias $ optsAlias opts
+
+parseStaticConfig :: FilePath -> IO (Maybe StaticConfig)
+parseStaticConfig p = do
+  res <- decodeFileEither p
+  case res of
+    Left e  -> print e >> return Nothing
+    Right c -> return $ Just c
+
+runPrompt :: RofiConf c => [RofiGroup c] -> RofiIO c ()
+runPrompt gs = selectAction $ emptyMenu
+               { groups = gs
+               , prompt = Just "Select Device"
+               }
+
+getGroups :: RofiMountIO [RofiGroup MountConf]
+getGroups = do
+  staticDevs <- asks mountconfStaticDevs
+  staticActions <- mapM mkAction $ configToTree' staticDevs
+  removableActions <- mapM mkAction =<< getRemovableDevices
+  mtpActions <- mapM mkAction =<< getMTPDevices
+  return $ mapMaybe mkGroup
+    $ groupBy (\(hx, _) (hy, _) -> hx == hy)
+    $ sortBy (\(hx, _) (hy, _) -> compare hx hy)
+    $ staticActions ++ removableActions ++ mtpActions
+
+mountByAlias :: Bool -> String -> RofiMountIO ()
+mountByAlias unmountFlag alias = do
+  static <- asks mountconfStaticDevs
+  mapM_ (`mountMaybe` unmountFlag) $ configToTree static <$> M.lookup alias static
+
+mkGroup :: [(Header, ProtoAction [String])] -> Maybe (RofiGroup MountConf)
+mkGroup [] = Nothing
+mkGroup as = let ((Header title _, _):_) = as in
+  Just $ titledGroup title $ toRofiActions $ alignEntries $ fmap snd as
+
+alignSep :: String
+alignSep = " | "
+
+alignEntries :: [ProtoAction [String]] -> [(String, RofiMountIO ())]
+alignEntries ps = zip (align es) as
+  where
+    (es, as) = unzip $ fmap (\(ProtoAction e a) -> (e, a)) ps
+    align = fmap (intercalate alignSep)
+      . transpose
+      . mapToLast pad
+      . transpose
+    pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
+    getMax = maximum . fmap length
+    mapToLast _ []     = []
+    mapToLast _ [x]    = [x]
+    mapToLast f (x:xs) = f x : mapToLast f xs
+
+--------------------------------------------------------------------------------
+-- | Global config used in the reader monad stack
+
+data MountConf = MountConf
+    { mountconfVolatilePath :: FilePath
+    , mountconfRofiArgs     :: [String]
+    , mountconfStaticDevs   :: M.Map String TreeConfig
+    , mountconfVerbose      :: Bool
+    } deriving Show
+
+instance RofiConf MountConf where
+  defArgs MountConf { mountconfRofiArgs = a } = a
+
+--------------------------------------------------------------------------------
+-- | Mountable typeclass
+--
+-- Class to provide common interface for anything that can be mounted.
+
+class Mountable a where
+  -- | Mount the given type (or dismount if False is passed)
+  mount :: a -> Bool -> RofiMountIO ()
+
+  mountMaybe :: a -> Bool -> RofiMountIO ()
+  mountMaybe dev mountFlag = do
+    mounted <- isMounted dev
+    verbose <- asks mountconfVerbose
+    if mountFlag == mounted then mount dev mountFlag
+      else when verbose notify'
+    where
+      notify' = io $ notify "dialog-information-symbolic"
+                $ getLabel dev ++ " already mounted"
+
+  -- | Check if the mounting utilities are present
+  allInstalled :: a -> RofiMountIO Bool
+
+  -- | Return a string representing the label of the device
+  getLabel :: a -> String
+
+  -- | Determine if the given type is mounted or not
+  isMounted :: a -> RofiMountIO Bool
+
+--------------------------------------------------------------------------------
+-- | Actionable typeclass
+--
+-- Class to provide common interface for anything that can be presented in the
+-- Rofi menu as an action. Note that this must be separate from the Mountable
+-- class above because some devices are represented as trees, and displaying
+-- these trees in the rofi menu only requires that the tree itself be presented
+-- and not its subcomponents.
+
+class Mountable a => Actionable a where
+  -- | Return a string to go in the Rofi menu for the given type
+  fmtEntry :: a -> [String]
+  fmtEntry d = [getLabel d]
+
+  groupHeader :: a -> Header
+
+  -- | Given a mountable type, return a rofi action (string to go in the
+  -- Rofi prompt and an action to perform when it is selected)
+  mkAction :: a -> RofiMountIO (Header, ProtoAction [String])
+  mkAction dev = do
+    m <- isMounted dev
+    i <- allInstalled dev
+    let h = groupHeader dev
+    let action = when i $ mountMaybe dev m
+    let entry = case fmtEntry dev of
+              (e:es) -> (mountedPrefix m i ++ e):es
+              _      -> []
+    return (h, ProtoAction entry action)
+    where
+      mountedPrefix False True = "  "
+      mountedPrefix True True  = "* "
+      mountedPrefix _ False    = "! "
+
+type RofiMountIO a = RofiIO MountConf a
+
+data Header = Header String Integer deriving (Show, Eq)
+
+data ProtoAction a = ProtoAction a (RofiMountIO ())
+
+instance Ord Header where
+  compare (Header _ x) (Header _ y) = compare x y
+
+--------------------------------------------------------------------------------
+-- | Static device configuration
+--
+-- Static devices are defined in a YAML file. These types/instances describe how
+-- to parse said YAML file.
 
 defaultTries :: Integer
 defaultTries = 2
@@ -192,27 +350,123 @@ instance FromJSON StaticConfig where
     <*> o .: "devices"
 
 --------------------------------------------------------------------------------
--- | Global config used in the reader monad stack
+-- | Static devices trees
 --
--- This is defined by the mount options on the command line, and holds:
--- - a map between mountpoints and a means to get passwords when mounting those
---   mountpoints
--- - a mount directory where mountpoints will be created if needed (defaults
---   to '/tmp/media/USER'
--- - any arguments to be passed to the rofi command
+-- Static devices as defined in the config file may declare dependencies on
+-- other static devices, and thus are best represented as a tree. Note that the
+-- tree is both Actionable and Mountable, where each node in the tree is only
+-- Mountable; this is because trees need to be displayed and chosen in the Rofi
+-- menu.
 
-data MountConf = MountConf
-    { mountconfVolatilePath :: FilePath
-    , mountconfRofiArgs     :: [String]
-    , mountconfStaticDevs   :: M.Map String TreeConfig
-    , mountconfVerbose      :: Bool
-    }
+data Tree a = Tree a [Tree a] deriving (Eq, Show)
 
-instance RofiConf MountConf where
-  defArgs MountConf { mountconfRofiArgs = a } = a
+type StaticConfigTree = Tree DeviceConfig
+
+instance Mountable a => Mountable (Tree a) where
+  mount (Tree p cs) False = mapM_ (`mountMaybe` False) cs >> mount p False
+  mount (Tree p _) True = mount p True
+
+  isMounted (Tree p _) = isMounted p
+
+  allInstalled (Tree p cs) = do
+    res <- and <$> mapM allInstalled cs
+    if res then allInstalled p else return res
+
+  getLabel (Tree p _) = getLabel p
+
+instance Actionable (Tree DeviceConfig) where
+  fmtEntry (Tree p@DeviceConfig{ _deviceData = d } _) = [getLabel p, target d] 
+    where
+      target CIFSConfig{ _cifsRemote = r } = r
+      target SSHFSConfig{ _sshfsRemote = r } = r
+      target VeracryptConfig{ _veracryptVolume = v } = v
+
+  groupHeader (Tree DeviceConfig{ _deviceData = d } _) =
+    case d of
+      CIFSConfig{} -> Header "CIFS Devices" 0
+      SSHFSConfig{} -> Header "SSHFS Devices" 1
+      VeracryptConfig{} -> Header "Veracrypt Devices" 2
+
+configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
+configToTree' devMap = configToTree devMap <$> M.elems devMap
+
+configToTree :: M.Map String TreeConfig -> TreeConfig -> StaticConfigTree
+configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
+  Tree p $ fmap go V.toList c
+  where
+    go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
 
 --------------------------------------------------------------------------------
--- | Password-getting functions
+-- | Static devices
+--
+-- This is complex because there may be multiple classes of static devices
+-- in the config file, and each device may depend on another device that is
+-- a different class (eg sshfs on cifs). I deal with this by abstracting the
+-- differences between each class in a sum-record type; in this way the
+-- processing "splits" and "converges" entirely in this function, so nothing
+-- outside of these needs to be aware of these different classes.
+
+instance Mountable DeviceConfig where
+  mount c@DeviceConfig{ _deviceMount = m, _deviceData = devData} False = do
+    m' <- getAbsMountpoint m
+    bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
+    where
+      mount' mountpoint = io $ case devData of
+        SSHFSConfig{ _sshfsRemote = r } -> do
+          runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
+        CIFSConfig{ _cifsPassword = p } -> do
+          res <- case p of
+            Just pwd -> do
+              pwd' <- maybe [] (\p' -> [("PASSWD", p')]) <$> configToPwd pwd
+              readCmdEither' "mount" [mountpoint] "" pwd'
+            Nothing -> readCmdEither "mount" [mountpoint] ""
+          notifyMounted (isRight res) False (getLabel c)
+        VeracryptConfig{ _veracryptPassword = getPwd, _veracryptVolume = v } ->
+          maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) (configToPwd <$> getPwd)
+          where
+            label = getLabel c
+            runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
+            runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False label)
+              =<< runVeraCrypt stdin ([v, mountpoint] ++ args)
+            notifyFail = notify "dialog-error-symbolic" $
+              printf "Failed to get volume password for %s" label
+
+  mount c@DeviceConfig{ _deviceMount = m, _deviceData = VeracryptConfig{} } True = do
+    m' <- getAbsMountpoint m
+    res <- io $ runVeraCrypt "" ["-d", m']
+    io $ notifyMounted (isRight res) True (getLabel c)
+  
+  mount c@DeviceConfig{ _deviceMount = m } True =
+    umountNotify (getLabel c) =<< getAbsMountpoint m
+
+  allInstalled DeviceConfig{ _deviceData = devData } = io $ isJust
+    <$> findExecutable (exe devData)
+    where
+      exe SSHFSConfig{} = "sshfs"
+      exe CIFSConfig{} = "mount.cifs"
+      exe VeracryptConfig{} = "veracrypt"
+
+  isMounted DeviceConfig{ _deviceMount = m } =
+    (io . isDirMounted) =<< getAbsMountpoint m
+
+  getLabel DeviceConfig
+    { _deviceMount = MountConfig { _mountMountPoint = p, _mountLabel = l }
+    } = fromMaybe (takeFileName p) l
+
+getAbsMountpoint :: MountConfig -> RofiMountIO FilePath
+getAbsMountpoint MountConfig{ _mountMountPoint = m } =
+  asks $ flip appendRoot m . mountconfVolatilePath
+
+-- NOTE: the user is assumed to have added themselves to the sudoers file so
+-- that this command will work
+runVeraCrypt :: String -> [String] -> IO (Either (Int, String, String) String)
+runVeraCrypt stdin args = do
+  readCmdEither "sudo" (defaultArgs ++ args) stdin
+  where
+    defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
+
+--------------------------------------------------------------------------------
+-- | Password-getting functions for static devices
 
 type PasswordGetter = IO (Maybe String)
 
@@ -253,85 +507,11 @@ configToPwd PasswordConfig{ _passwordBitwarden = b
       if isNothing res then y else return res
 
 --------------------------------------------------------------------------------
--- | Main prompt
---
--- This command will have one Rofi prompt and will display all available
--- mounts grouped by device type (eg removable, sshfs, cifs, etc). I like
--- pretty things, so ensure the entries are aligned properly as well
-
-runMounts :: Opts -> IO ()
-runMounts opts = do
-  static <- join <$> traverse parseStaticConfig (optsConfig opts)
-  defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
-  let tmpPath = fromMaybe defaultTmpPath $ _staticconfigTmpPath =<< static
-  let staticDevs = maybe M.empty _staticconfigDevices static
-  let verbose = fromMaybe False $ _staticconfigVerbose =<< static
-  let mountconf = MountConf
-        { mountconfVolatilePath = tmpPath
-        , mountconfRofiArgs = optsRofiArgs opts
-        , mountconfStaticDevs = staticDevs
-        , mountconfVerbose = verbose
-        }
-  let byAlias = mountByAlias $ optsUnmount opts
-  let byPrompt = runPrompt =<< getGroups
-  runRofiIO mountconf $ maybe byPrompt byAlias $ optsAlias opts
-
-parseStaticConfig :: FilePath -> IO (Maybe StaticConfig)
-parseStaticConfig p = do
-  res <- decodeFileEither p
-  case res of
-    Left e  -> print e >> return Nothing
-    Right c -> return $ Just c
-
-runPrompt :: RofiConf c => [RofiGroup c] -> RofiIO c ()
-runPrompt gs = selectAction $ emptyMenu
-               { groups = gs
-               , prompt = Just "Select Device"
-               }
-
-getGroups :: RofiIO MountConf [RofiGroup MountConf]
-getGroups = do
-  staticDevs <- asks mountconfStaticDevs
-  staticActions <- mapM mkAction $ configToTree' staticDevs
-  removableActions <- mapM mkAction =<< getRemovableDevices
-  mtpActions <- mapM mkAction =<< getMTPDevices
-  return $ mapMaybe mkGroup
-    $ groupBy (\(hx, _) (hy, _) -> hx == hy)
-    $ sortBy (\(hx, _) (hy, _) -> compare hx hy)
-    $ staticActions ++ removableActions ++ mtpActions
-
-mountByAlias :: Bool -> String -> RofiIO MountConf ()
-mountByAlias unmountFlag alias = do
-  static <- asks mountconfStaticDevs
-  mapM_ (`mountMaybe` unmountFlag) $ configToTree static <$> M.lookup alias static
-
-mkGroup :: [(Header, ProtoAction [String])] -> Maybe (RofiGroup MountConf)
-mkGroup [] = Nothing
-mkGroup as = let ((Header title _, _):_) = as in
-  Just $ titledGroup title $ toRofiActions $ alignEntries $ fmap snd as
-
-alignSep :: String
-alignSep = " | "
-
-alignEntries :: [ProtoAction [String]] -> [(String, RofiIO MountConf ())]
-alignEntries ps = zip (align es) as
-  where
-    (es, as) = unzip $ fmap (\(ProtoAction e a) -> (e, a)) ps
-    align = fmap (intercalate alignSep)
-      . transpose
-      . mapToLast pad
-      . transpose
-    pad xs = let m = getMax xs in fmap (\x -> take m (x ++ repeat ' ')) xs
-    getMax = maximum . fmap length
-    mapToLast _ []     = []
-    mapToLast _ [x]    = [x]
-    mapToLast f (x:xs) = f x : mapToLast f xs
-
---------------------------------------------------------------------------------
 -- | Removable devices
 --
--- A device which can be removed (which is all the devices we care about)
--- This can be minimally described by a device DEVICESPEC and LABEL.
+-- A device which can be removed (such as a flash drive). These are distinct
+-- from any device in the static configuration in that they only have device
+-- addresses (eg in /dev) and labels.
 
 data Removable = Removable
     { deviceSpec :: String
@@ -375,24 +555,7 @@ getRemovableDevices = fromLines toDev . lines
     mk d l = Just $ Removable { deviceSpec = d, label = l }
 
 --------------------------------------------------------------------------------
--- | VeraCrypt Devices
---
-
--- NOTE: the user is assumed to have added themselves to the sudoers file so
--- that this command will work
-runVeraCrypt :: String -> [String] -> IO (Either (Int, String, String) String)
-runVeraCrypt stdin args = do
-  readCmdEither "sudo" (defaultArgs ++ args) stdin
-  where
-    defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
-
---------------------------------------------------------------------------------
 -- | MTP devices
---
--- These devices are a bit special because they are not based on Removable
--- devices (eg they don't have a label and a device spec). Instead they
--- are defined by a bus:device path. The program used for this is jmtpfs
--- (which seems to be the fastest and most robust)
 
 data MTPFS = MTPFS
     { bus         :: String
@@ -420,13 +583,8 @@ instance Mountable MTPFS where
 
   getLabel MTPFS { description = d } = d
 
-instance Actionable MTPFS where
-  fmtEntry d = [getLabel d]
-
-  groupHeader _ = Header "MTP Devices" 5
-
 -- | Return list of all available MTP devices
-getMTPDevices :: RofiIO MountConf [MTPFS]
+getMTPDevices :: RofiMountIO [MTPFS]
 getMTPDevices = do
   dir <- asks mountconfVolatilePath
   res <- io $ readProcess "jmtpfs" ["-l"] ""
@@ -451,164 +609,10 @@ getMTPDevices = do
       | c == ' ' = Just '-'
       | otherwise = Just c
 
---------------------------------------------------------------------------------
--- | Static Device Wrapper
---
--- In order to make a consistent interface for the static device types, create
--- a wrapper type to encapsulate them.
-
-data Tree a = Tree a [Tree a] deriving (Eq, Show)
-
-type StaticConfigTree = Tree DeviceConfig
-
-instance Actionable (Tree DeviceConfig) where
-  fmtEntry (Tree p@DeviceConfig{ _deviceData = d } _) = [getLabel p, target d] 
-    where
-      target CIFSConfig{ _cifsRemote = r } = r
-      target SSHFSConfig{ _sshfsRemote = r } = r
-      target VeracryptConfig{ _veracryptVolume = v } = v
-
-  groupHeader (Tree DeviceConfig{ _deviceData = d } _) =
-    case d of
-      CIFSConfig{} -> Header "CIFS Devices" 0
-      SSHFSConfig{} -> Header "SSHFS Devices" 1
-      VeracryptConfig{} -> Header "Veracrypt Devices" 2
-
-configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
-configToTree' devMap = configToTree devMap <$> M.elems devMap
-
-configToTree :: M.Map String TreeConfig -> TreeConfig -> StaticConfigTree
-configToTree devMap TreeConfig{ _treeParent = p, _treeChildren = c } =
-  Tree p $ fmap go V.toList c
-  where
-    go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
-
-instance Mountable a => Mountable (Tree a) where
-  mount (Tree p cs) False = mapM_ (`mountMaybe` False) cs >> mount p False
-  mount (Tree p _) True = mount p True
-
-  isMounted (Tree p _) = isMounted p
-
-  allInstalled (Tree p cs) = do
-    res <- and <$> mapM allInstalled cs
-    if res then allInstalled p else return res
-
-  getLabel (Tree p _) = getLabel p
-
-instance Mountable DeviceConfig where
-  mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }
-                      , _deviceData = devData
-                      } False = do
-    m' <- getAbsMountpoint m
-    bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
-    where
-      mount' mountpoint = io $ case devData of
-        SSHFSConfig{ _sshfsRemote = r } -> do
-          runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
-        CIFSConfig{ _cifsPassword = p } -> do
-          res <- case p of
-            Just pwd -> do
-              pwd' <- maybe [] (\p' -> [("PASSWD", p')]) <$> configToPwd pwd
-              readCmdEither' "mount" [mountpoint] "" pwd'
-            Nothing -> readCmdEither "mount" [mountpoint] ""
-          notifyMounted (isRight res) False (getLabel c)
-        VeracryptConfig{ _veracryptPassword = getPwd, _veracryptVolume = v } ->
-          maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) (configToPwd <$> getPwd)
-          where
-            l = getLabel c
-            runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
-            runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False l)
-              =<< runVeraCrypt stdin ([v, mountpoint] ++ args)
-            notifyFail = notify "dialog-error-symbolic" $
-              printf "Failed to get volume password for %s" l
-
-  mount c@DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }
-                      , _deviceData = VeracryptConfig{} } True = do
-    m' <- getAbsMountpoint m
-    res <- io $ runVeraCrypt "" ["-d", m']
-    io $ notifyMounted (isRight res) True (getLabel c)
-  
-  mount c@DeviceConfig{ _deviceMount = MountConfig { _mountMountPoint = m }} True =
-    umountNotify (getLabel c) =<< getAbsMountpoint m
-
-  allInstalled DeviceConfig{ _deviceData = devData } = io $ isJust
-    <$> findExecutable (exe devData)
-    where
-      exe SSHFSConfig{} = "sshfs"
-      exe CIFSConfig{} = "mount.cifs"
-      exe VeracryptConfig{} = "veracrypt"
-
-  isMounted DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = m }} =
-    (io . isDirMounted) =<< getAbsMountpoint m
-
-  getLabel DeviceConfig{ _deviceMount = MountConfig{ _mountMountPoint = p, _mountLabel = l }} =
-    fromMaybe (takeFileName p) l
-
-getAbsMountpoint :: FilePath -> RofiIO MountConf FilePath
-getAbsMountpoint p = asks $ flip appendRoot p . mountconfVolatilePath
-
---------------------------------------------------------------------------------
--- | Mountable typeclass
---
--- Let this class represent anything that can be mounted. The end goal is to
--- create a Rofi action which will define an entry in the rofi prompt for the
--- device at hand. In order to make an action, we need functions to mount the
--- device, check if the necessary mounting program(s) is installed, make the
--- entry to go in the prompt, and test if the device is mounted.
-
-class Mountable a where
-  -- | Mount the given type (or dismount if False is passed)
-  mount :: a -> Bool -> RofiIO MountConf ()
-
-  mountMaybe :: a -> Bool -> RofiIO MountConf ()
-  mountMaybe dev mountFlag = do
-    mounted <- isMounted dev
-    verbose <- asks mountconfVerbose
-    if mountFlag == mounted then mount dev mountFlag
-      else when verbose notify'
-    where
-      notify' = io $ notify "dialog-information-symbolic"
-                $ getLabel dev ++ " already mounted"
-
-  -- | Check if the mounting utilities are present
-  allInstalled :: a -> RofiIO MountConf Bool
-
-  -- | Return a string representing the label of the device
-  getLabel :: a -> String
-
-  -- | Determine if the given type is mounted or not
-  isMounted :: a -> RofiIO MountConf Bool
-
-data Header = Header String Integer deriving (Show, Eq)
-
-data ProtoAction a = ProtoAction a (RofiIO MountConf ())
-
-instance Ord Header where
-  compare (Header _ x) (Header _ y) = compare x y
-
-class Mountable a => Actionable a where
-  -- | Return a string to go in the Rofi menu for the given type
-  fmtEntry :: a -> [String]
+instance Actionable MTPFS where
   fmtEntry d = [getLabel d]
 
-  groupHeader :: a -> Header
-
-  -- | Given a mountable type, return a rofi action (string to go in the
-  -- Rofi prompt and an action to perform when it is selected)
-  mkAction :: a -> RofiIO MountConf (Header, ProtoAction [String])
-  mkAction dev = do
-    m <- isMounted dev
-    i <- allInstalled dev
-    let h = groupHeader dev
-    let action = when i $ mountMaybe dev m
-    let entry = case fmtEntry dev of
-              (e:es) -> (mountedPrefix m i ++ e):es
-              _      -> []
-    return (h, ProtoAction entry action)
-    where
-      mountedPrefix False True = "  "
-      mountedPrefix True True  = "* "
-      mountedPrefix _ False    = "! "
+  groupHeader _ = Header "MTP Devices" 5
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
@@ -631,10 +635,10 @@ curMountpoints = curMountField 1
 -- base path in /tmp, so all this is saying is that umounting everything will
 -- leave /tmp/media/USER without removing all the way down to /tmp)
 
-mkDirMaybe :: FilePath -> RofiIO MountConf ()
+mkDirMaybe :: FilePath -> RofiMountIO ()
 mkDirMaybe fp = whenInMountDir fp $ io $ createDirectoryIfMissing True fp
 
-rmDirMaybe :: FilePath -> RofiIO MountConf ()
+rmDirMaybe :: FilePath -> RofiMountIO ()
 rmDirMaybe fp = whenInMountDir fp $ unlessMountpoint fp
   $ asks mountconfVolatilePath >>= io . rmUntil fp
   where
@@ -642,12 +646,12 @@ rmDirMaybe fp = whenInMountDir fp $ unlessMountpoint fp
       removePathForcibly cur
       rmUntil (takeDirectory cur) target
 
-whenInMountDir :: FilePath -> RofiIO MountConf () -> RofiIO MountConf ()
+whenInMountDir :: FilePath -> RofiMountIO () -> RofiIO MountConf ()
 whenInMountDir fp f = do
   mDir <- asks mountconfVolatilePath
   when (mDir `isPrefixOf` fp) f
 
-unlessMountpoint :: FilePath -> RofiIO MountConf () -> RofiIO MountConf ()
+unlessMountpoint :: MonadIO m => FilePath -> m () -> m ()
 unlessMountpoint fp f = do
   mounted <- io $ isDirMounted fp
   unless mounted f
@@ -660,12 +664,12 @@ runMountNotify cmd args msg mounted = do
   res <- readCmdEither cmd args ""
   notifyMounted (isRight res) mounted msg
 
-umountNotify' :: String -> String -> FilePath -> RofiIO MountConf ()
+umountNotify' :: String -> String -> FilePath -> RofiMountIO ()
 umountNotify' cmd msg dir = finally
   (io $ runMountNotify cmd [dir] msg True)
   (rmDirMaybe dir)
 
-umountNotify :: String -> FilePath -> RofiIO MountConf ()
+umountNotify :: String -> FilePath -> RofiMountIO ()
 umountNotify = umountNotify' "umount"
 
 -- | Send a notification indicating the mount succeeded
