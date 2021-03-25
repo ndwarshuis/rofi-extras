@@ -15,7 +15,6 @@ import           Bitwarden.Internal
 import           Control.Monad
 import           Control.Monad.Reader
 
-import           Data.Either
 import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
@@ -111,14 +110,11 @@ runPrompt gs = selectAction $ emptyMenu
 
 getGroups :: RofiMountIO [RofiGroup MountConf]
 getGroups = do
-  staticDevs <- asks mountconfStaticDevs
-  staticActions <- mapM mkAction $ configToTree' staticDevs
-  removableActions <- mapM mkAction =<< getRemovableDevices
-  mtpActions <- mapM mkAction =<< getMTPDevices
+  actions <- sequence [getStaticActions, getRemovableActions, getMTPActions]
   return $ mapMaybe mkGroup
     $ groupBy (\(hx, _) (hy, _) -> hx == hy)
     $ sortBy (\(hx, _) (hy, _) -> compare hx hy)
-    $ staticActions ++ removableActions ++ mtpActions
+    $ concat actions
 
 mountByAlias :: Bool -> String -> RofiMountIO ()
 mountByAlias unmountFlag alias = do
@@ -151,11 +147,11 @@ alignEntries ps = zip (align es) as
 -- | Global config used in the reader monad stack
 
 data MountConf = MountConf
-    { mountconfVolatilePath :: FilePath
-    , mountconfRofiArgs     :: [String]
-    , mountconfStaticDevs   :: M.Map String TreeConfig
-    , mountconfVerbose      :: Bool
-    } deriving Show
+  { mountconfVolatilePath :: FilePath
+  , mountconfRofiArgs     :: [String]
+  , mountconfStaticDevs   :: M.Map String TreeConfig
+  , mountconfVerbose      :: Bool
+  } deriving Show
 
 instance RofiConf MountConf where
   defArgs MountConf { mountconfRofiArgs = a } = a
@@ -167,17 +163,17 @@ instance RofiConf MountConf where
 
 class Mountable a where
   -- | Mount the given type (or dismount if False is passed)
-  mount :: a -> Bool -> RofiMountIO ()
+  mount :: a -> Bool -> RofiMountIO MountResult
 
   mountMaybe :: a -> Bool -> RofiMountIO ()
   mountMaybe dev mountFlag = do
     mounted <- isMounted dev
     verbose <- asks mountconfVerbose
-    if mountFlag == mounted then mount dev mountFlag
+    if mountFlag == mounted
+      then (io . notifyMountResult mounted (getLabel dev)) =<< mount dev mountFlag
       else when verbose notify'
     where
-      notify' = io $ notify "dialog-information-symbolic"
-                $ getLabel dev ++ " already mounted"
+      notify' = io $ notify IconInfo (getLabel dev ++ " already mounted") Nothing
 
   -- | Check if the mounting utilities are present
   allInstalled :: a -> RofiMountIO Bool
@@ -221,6 +217,9 @@ class Mountable a => Actionable a where
       mountedPrefix True True  = "* "
       mountedPrefix _ False    = "! "
 
+mountableToAction :: Actionable a => RofiMountIO [a] -> RofiMountIO [(Header, ProtoAction [String])]
+mountableToAction ms = mapM mkAction =<< ms
+
 type RofiMountIO a = RofiIO MountConf a
 
 -- headers appear in the order listed here (per Enum)
@@ -241,10 +240,10 @@ instance Show Header where
     where
       suffix = (++ " Devices")
 
-data ProtoAction a = ProtoAction a (RofiMountIO ())
-
 instance Ord Header where
   compare x y = compare (fromEnum x) (fromEnum y)
+
+data ProtoAction a = ProtoAction a (RofiMountIO ())
 
 --------------------------------------------------------------------------------
 -- | Static device configuration
@@ -422,37 +421,21 @@ configToTree devMap TreeConfig{ treeParent = p, treeconfigChildren = c } =
 -- outside of these needs to be aware of these different classes.
 
 instance Mountable DeviceConfig where
-  mount c@DeviceConfig{ deviceMount = m, deviceData = devData} False = do
+  mount DeviceConfig{ deviceMount = m, deviceData = devData} False = do
     m' <- getAbsMountpoint m
-    bracketOnError_ (mkDirMaybe m') (rmDirMaybe m') $ mount' m'
-    where
-      mount' mountpoint = io $ case devData of
-        SSHFSConfig{ sshfsRemote = r } -> do
-          runMountNotify "sshfs" [r, mountpoint] (getLabel c) False
-        CIFSConfig{ cifsPassword = p } -> do
-          res <- case p of
-            Just pwd -> do
-              pwd' <- maybe [] (\p' -> [("PASSWD", p')]) <$> configToPwd pwd
-              readCmdEither' "mount" [mountpoint] "" pwd'
-            Nothing -> readCmdEither "mount" [mountpoint] ""
-          notifyMounted (isRight res) False (getLabel c)
-        VeracryptConfig{ veracryptPassword = getPwd, veracryptVolume = v } ->
-          maybe (runVeraCryptWith "" []) (runVeraCryptWithPwd =<<) (configToPwd <$> getPwd)
-          where
-            label = getLabel c
-            runVeraCryptWithPwd = maybe notifyFail (\p -> runVeraCryptWith p ["--stdin"])
-            runVeraCryptWith stdin args = (\res -> notifyMounted (isRight res) False label)
-              =<< runVeraCrypt stdin ([v, mountpoint] ++ args)
-            notifyFail = notify "dialog-error-symbolic" $
-              printf "Failed to get volume password for %s" label
+    withTmpMountDir m'
+      $ io
+      $ case devData of
+          SSHFSConfig{ sshfsRemote = r } -> mountSSHFS m' r
+          CIFSConfig{ cifsPassword = p } -> mountCIFS m' p
+          VeracryptConfig{ veracryptPassword = p, veracryptVolume = v } ->
+            mountVeracrypt m' p v
 
-  mount c@DeviceConfig{ deviceMount = m, deviceData = VeracryptConfig{} } True = do
+  mount DeviceConfig{ deviceMount = m, deviceData = d } True = do
     m' <- getAbsMountpoint m
-    res <- io $ runVeraCrypt "" ["-d", m']
-    io $ notifyMounted (isRight res) True (getLabel c)
-  
-  mount c@DeviceConfig{ deviceMount = m } True =
-    umountNotify (getLabel c) =<< getAbsMountpoint m
+    runAndRemoveDir m' $ io $ case d of
+      VeracryptConfig{} -> runVeraCrypt ["-d", m'] ""
+      _                 -> runMount "umount" [m'] ""
 
   allInstalled DeviceConfig{ deviceData = devData } = io $ isJust
     <$> findExecutable (exe devData)
@@ -468,17 +451,35 @@ instance Mountable DeviceConfig where
     { deviceMount = MountConfig { mountMountpoint = p, mountLabel = l }
     } = fromMaybe (takeFileName p) l
 
+mountSSHFS :: FilePath -> String -> IO MountResult
+mountSSHFS mountpoint remote = runMount "sshfs" [remote, mountpoint] ""
+
+mountCIFS :: FilePath -> Maybe PasswordConfig -> IO MountResult
+mountCIFS mountpoint pwdConfig = withPasswordGetter pwdConfig runPwd run
+  where
+    run = runMount "mount" [mountpoint] ""
+    runPwd p = runMount' "mount" [mountpoint] "" [("PASSWD", p)]
+
+mountVeracrypt :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
+mountVeracrypt mountpoint pwdConfig volume = 
+  withPasswordGetter pwdConfig (runVeraCrypt (args ++ ["--stdin"]))
+  $ runVeraCrypt args ""
+  where
+    args = [volume, mountpoint]
+
+-- NOTE: the user is assumed to have added themselves to the sudoers file so
+-- that this command will work
+runVeraCrypt :: [String] -> String -> IO MountResult
+runVeraCrypt args = runMount "sudo" (defaultArgs ++ args)
+  where
+    defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
+
 getAbsMountpoint :: MountConfig -> RofiMountIO FilePath
 getAbsMountpoint MountConfig{ mountMountpoint = m } =
   asks $ flip appendRoot m . mountconfVolatilePath
 
--- NOTE: the user is assumed to have added themselves to the sudoers file so
--- that this command will work
-runVeraCrypt :: String -> [String] -> IO (Either (Int, String, String) String)
-runVeraCrypt stdin args = do
-  readCmdEither "sudo" (defaultArgs ++ args) stdin
-  where
-    defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
+getStaticActions :: RofiMountIO [(Header, ProtoAction [String])]
+getStaticActions = mountableToAction $ asks $ configToTree' . mountconfStaticDevs 
 
 --------------------------------------------------------------------------------
 -- | Password-getting functions for static devices
@@ -516,6 +517,13 @@ configToPwd PasswordConfig
     getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . promptTries)
     runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
 
+withPasswordGetter :: Maybe PasswordConfig -> (String -> IO MountResult)
+  -> IO MountResult -> IO MountResult
+withPasswordGetter (Just pwdConfig) runPwd _ =
+  maybe (return $ MountError "Password could not be obtained") runPwd
+  =<< configToPwd pwdConfig
+withPasswordGetter Nothing _ run = run
+
 --------------------------------------------------------------------------------
 -- | Removable devices
 --
@@ -524,14 +532,14 @@ configToPwd PasswordConfig
 -- addresses (eg in /dev) and labels.
 
 data Removable = Removable
-    { removablePath :: String
-    , removableLabel      :: String
+    { removablePath  :: String
+    , removableLabel :: String
     }
     deriving (Eq, Show)
 
 instance Mountable Removable where
-  mount Removable { removablePath = d, removableLabel = l } m =
-    io $ runMountNotify "udisksctl" [c, "-b", d] l m
+  mount Removable { removablePath = d } m =
+    io $ runMount "udisksctl" [c, "-b", d] ""
     where
       c = if m then "unmount" else "mount"
 
@@ -564,6 +572,9 @@ getRemovableDevices = fromLines toDev . lines
       _                  -> Nothing
     mk d l = Just $ Removable { removablePath = d, removableLabel = l }
 
+getRemovableActions :: RofiMountIO [(Header, ProtoAction [String])]
+getRemovableActions = mountableToAction getRemovableDevices
+
 --------------------------------------------------------------------------------
 -- | MTP devices
 
@@ -576,19 +587,13 @@ data MTPFS = MTPFS
     deriving (Eq, Show)
 
 instance Mountable MTPFS where
-  mount MTPFS { mtpfsBus = b
-              , mtpfsDevice = n
-              , mtpfsMountpoint = m
-              , mtpfsDescription = d
-              } False = do
+  mount MTPFS { mtpfsBus = b, mtpfsDevice = n, mtpfsMountpoint = m } False = do
     -- TODO add autodismount to options
     let dev = "-device=" ++ b ++ "," ++ n
-    bracketOnError_
-      (mkDirMaybe m)
-      (rmDirMaybe m)
-      $ io $ runMountNotify "jmtpfs" [dev, m] d False
+    withTmpMountDir m $ io $ runMount "jmtpfs" [dev, m] ""
 
-  mount MTPFS { mtpfsMountpoint = m, mtpfsDescription = d } True = umountNotify d m
+  mount MTPFS { mtpfsMountpoint = m } True =
+    runAndRemoveDir m $ io $ runMount "nmount" [m] ""
 
   -- | return True always since the list won't even show without jmtpfs
   allInstalled _ = return True
@@ -623,10 +628,51 @@ getMTPDevices = do
       | c == ' ' = Just '-'
       | otherwise = Just c
 
+getMTPActions :: RofiMountIO [(Header, ProtoAction [String])]
+getMTPActions = mountableToAction getMTPDevices
+
 instance Actionable MTPFS where
   fmtEntry d = [getLabel d]
 
   groupHeader _ = MTPFSHeader
+
+--------------------------------------------------------------------------------
+-- | Notifications
+
+data NotifyIcon = IconError | IconInfo
+
+instance Show NotifyIcon where
+  show IconError = "dialog-error-symbolic"
+  show IconInfo = "dialog-information-symbolic"
+
+notifyMountResult :: Bool -> String -> MountResult -> IO ()
+notifyMountResult mounted label result = case result of
+  MountError e -> notify IconError (printf "Failed to %s %s" verb label) $ Just e
+  MountSuccess -> notify IconInfo (printf "Successfully %sed %s" verb label) Nothing
+  where
+    verb = if mounted then "unmount" else "mount" :: String
+
+notify :: NotifyIcon -> String -> Maybe String -> IO ()
+notify icon summary body = void $ spawnProcess "notify-send"
+  $ maybe args (\b -> args ++ [b]) body
+  where
+    args = ["-i", show icon, summary]
+
+--------------------------------------------------------------------------------
+-- | Mount commands
+
+data MountResult = MountSuccess | MountError String deriving (Show, Eq)
+
+runMount :: String -> [String] -> String -> IO MountResult
+runMount cmd args stdin = eitherToMountResult <$> readCmdEither cmd args stdin
+
+runMount' :: String -> [String] -> String -> [(String, String)] -> IO MountResult
+runMount' cmd args stdin environ = eitherToMountResult
+  <$> readCmdEither' cmd args stdin environ
+
+eitherToMountResult :: Either (Int, String, String) String -> MountResult
+eitherToMountResult (Right _) = MountSuccess
+eitherToMountResult (Left (_, _, e)) = MountError e 
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
@@ -649,6 +695,19 @@ curMountpoints = curMountField 1
 -- base path in /tmp, so all this is saying is that umounting everything will
 -- leave /tmp/media/USER without removing all the way down to /tmp)
 
+rmDirOnMountError :: FilePath -> RofiMountIO MountResult -> RofiMountIO MountResult
+rmDirOnMountError d f = do
+  res <- f
+  unless (res == MountSuccess) $ rmDirMaybe d
+  return res
+
+withTmpMountDir :: FilePath -> RofiMountIO MountResult -> RofiMountIO MountResult
+withTmpMountDir m = rmDirOnMountError m
+  . bracketOnError_ (mkDirMaybe m) (rmDirMaybe m)
+
+runAndRemoveDir :: FilePath -> RofiMountIO MountResult -> RofiMountIO MountResult
+runAndRemoveDir m f = rmDirOnMountError m $ finally f (rmDirMaybe m)
+
 mkDirMaybe :: FilePath -> RofiMountIO ()
 mkDirMaybe fp = whenInMountDir fp $ io $ createDirectoryIfMissing True fp
 
@@ -660,7 +719,7 @@ rmDirMaybe fp = whenInMountDir fp $ unlessMountpoint fp
       removePathForcibly cur
       rmUntil (takeDirectory cur) target
 
-whenInMountDir :: FilePath -> RofiMountIO () -> RofiIO MountConf ()
+whenInMountDir :: FilePath -> RofiMountIO () -> RofiMountIO ()
 whenInMountDir fp f = do
   mDir <- asks mountconfVolatilePath
   when (mDir `isPrefixOf` fp) f
@@ -672,32 +731,6 @@ unlessMountpoint fp f = do
 
 isDirMounted :: FilePath -> IO Bool
 isDirMounted fp = elem fp <$> curMountpoints
-
-runMountNotify :: String -> [String] -> String -> Bool -> IO ()
-runMountNotify cmd args msg mounted = do
-  res <- readCmdEither cmd args ""
-  notifyMounted (isRight res) mounted msg
-
-umountNotify' :: String -> String -> FilePath -> RofiMountIO ()
-umountNotify' cmd msg dir = finally
-  (io $ runMountNotify cmd [dir] msg True)
-  (rmDirMaybe dir)
-
-umountNotify :: String -> FilePath -> RofiMountIO ()
-umountNotify = umountNotify' "umount"
-
--- | Send a notification indicating the mount succeeded
-notifyMounted :: Bool -> Bool -> String -> IO ()
-notifyMounted succeeded mounted label = notify icon body
-  where
-    (format, icon) = if succeeded
-      then ("Successfully %sed %s", "dialog-information-symbolic")
-      else ("Failed to %s %s", "dialog-error-symbolic")
-    m = if mounted then "unmount" else "mount" :: String
-    body = printf format m label
-
-notify :: String -> String -> IO ()
-notify icon body = void $ spawnProcess "notify-send" ["-i", icon, body]
 
 --------------------------------------------------------------------------------
 -- | Other functions
