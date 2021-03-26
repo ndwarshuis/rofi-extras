@@ -296,7 +296,7 @@ instance FromJSON PromptConfig where
 data PasswordConfig = PasswordConfig
   { passwordBitwarden :: Maybe BitwardenConfig
   , passwordLibSecret :: Maybe LibSecretConfig
-  , passwordPrompt :: Maybe PromptConfig
+  , passwordPrompt    :: Maybe PromptConfig
   }
   deriving Show
 
@@ -306,24 +306,41 @@ instance FromJSON PasswordConfig where
     <*> o .:? "libsecret"
     <*> o .:? "prompt"
 
+data CIFSOptsConfig = CIFSOptsConfig
+  { cifsoptsUsername   :: Maybe String
+  , cifsoptsWorkgroup  :: Maybe String
+  , cifsoptsUID        :: Maybe Integer
+  , cifsoptsGID        :: Maybe Integer
+  , cifsoptsIocharset :: Maybe String
+  } deriving Show
+
+instance FromJSON CIFSOptsConfig where
+  parseJSON = withObject "options" $ \o -> CIFSOptsConfig
+    <$> o .:? "username"
+    <*> o .:? "workgroup"
+    <*> o .:? "uid"
+    <*> o .:? "gid"
+    <*> o .:? "isocharset"
+
 data DataConfig = VeracryptConfig
-  { veracryptVolume :: String
+  { veracryptVolume   :: String
   , veracryptPassword :: Maybe PasswordConfig
   } | SSHFSConfig
   { sshfsRemote :: String
   } | CIFSConfig
-  { cifsRemote :: String
-  , cifsSudo :: Bool
-  , cifsPassword :: Maybe PasswordConfig
+  { cifsRemote     :: String
+  , cifsSudo       :: Bool
+  , cifsPassword   :: Maybe PasswordConfig
+  , cifsOpts       :: Maybe CIFSOptsConfig
   } deriving Show
 
 data DeviceConfig = DeviceConfig
   { deviceMount :: MountConfig
-  , deviceData :: DataConfig
+  , deviceData  :: DataConfig
   } deriving Show
 
 data TreeConfig = TreeConfig
-  { treeParent :: DeviceConfig
+  { treeParent         :: DeviceConfig
   , treeconfigChildren :: V.Vector String
   } deriving Show
 
@@ -337,6 +354,7 @@ instance FromJSON TreeConfig where
                    <$> o .: "remote"
                    <*> o .:? "sudo" .!= False
                    <*> o .:? "password"
+                   <*> o .:? "options"
                  "sshfs"     -> SSHFSConfig
                    <$> o .: "remote"
                  "veracrypt" -> VeracryptConfig
@@ -429,7 +447,12 @@ instance Mountable DeviceConfig where
       $ io
       $ case devData of
           SSHFSConfig{ sshfsRemote = r } -> mountSSHFS m' r
-          CIFSConfig{ cifsPassword = p, cifsSudo = s } -> mountCIFS s m' p
+          CIFSConfig
+            { cifsRemote = r
+            , cifsSudo = s
+            , cifsPassword = p
+            , cifsOpts = o
+            } -> mountCIFS s r m' o p
           VeracryptConfig{ veracryptPassword = p, veracryptVolume = v } ->
             mountVeracrypt m' p v
 
@@ -457,11 +480,25 @@ instance Mountable DeviceConfig where
 mountSSHFS :: FilePath -> String -> IO MountResult
 mountSSHFS mountpoint remote = runMount "sshfs" [remote, mountpoint] ""
 
-mountCIFS :: Bool -> FilePath -> Maybe PasswordConfig -> IO MountResult
-mountCIFS useSudo mountpoint pwdConfig = withPasswordGetter pwdConfig runPwd run
+mountCIFS :: Bool -> String -> FilePath -> Maybe CIFSOptsConfig 
+  -> Maybe PasswordConfig -> IO MountResult
+mountCIFS useSudo remote mountpoint opts pwdConfig =
+  withPasswordGetter pwdConfig runPwd run
   where
-    run = runMountSudoMaybe useSudo "mount" [mountpoint]
-    runPwd p = runMountSudoMaybe' useSudo "mount" [mountpoint] [("PASSWD", p)]
+    run = runMountSudoMaybe useSudo "mount.cifs" args
+    runPwd p = runMountSudoMaybe' useSudo "mount.cifs" args [("PASSWD", p)]
+    args = [remote, mountpoint] ++ maybe [] (\o -> ["-o", fromCIFSOpts o]) opts
+
+fromCIFSOpts :: CIFSOptsConfig -> String
+fromCIFSOpts o = intercalate "," $ mapMaybe concatMaybe fs
+  where
+    fs = [ ("username", cifsoptsUsername)
+         , ("workgroup", cifsoptsWorkgroup)
+         , ("uid", fmap show . cifsoptsUID)
+         , ("gid", fmap show .  cifsoptsGID)
+         , ("iocharset", cifsoptsIocharset)
+         ]
+    concatMaybe (k, f) = (\v -> k ++ "=" ++ v) <$> f o
 
 mountVeracrypt :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
 mountVeracrypt mountpoint pwdConfig volume = 
