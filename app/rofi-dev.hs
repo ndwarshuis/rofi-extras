@@ -313,6 +313,7 @@ data DataConfig = VeracryptConfig
   { sshfsRemote :: String
   } | CIFSConfig
   { cifsRemote :: String
+  , cifsSudo :: Bool
   , cifsPassword :: Maybe PasswordConfig
   } deriving Show
 
@@ -334,6 +335,7 @@ instance FromJSON TreeConfig where
     devData <- case (devType :: String) of
                  "cifs"      -> CIFSConfig
                    <$> o .: "remote"
+                   <*> o .:? "sudo" .!= False
                    <*> o .:? "password"
                  "sshfs"     -> SSHFSConfig
                    <$> o .: "remote"
@@ -427,15 +429,16 @@ instance Mountable DeviceConfig where
       $ io
       $ case devData of
           SSHFSConfig{ sshfsRemote = r } -> mountSSHFS m' r
-          CIFSConfig{ cifsPassword = p } -> mountCIFS m' p
+          CIFSConfig{ cifsPassword = p, cifsSudo = s } -> mountCIFS s m' p
           VeracryptConfig{ veracryptPassword = p, veracryptVolume = v } ->
             mountVeracrypt m' p v
 
   mount DeviceConfig{ deviceMount = m, deviceData = d } True = do
     m' <- getAbsMountpoint m
     runAndRemoveDir m' $ io $ case d of
-      VeracryptConfig{} -> runVeraCrypt ["-d", m'] ""
-      _                 -> runMount "umount" [m'] ""
+      CIFSConfig{ cifsSudo = s } -> runMountSudoMaybe s "umount" [m'] 
+      VeracryptConfig{}          -> runVeraCrypt ["-d", m'] ""
+      _                          -> runMount "umount" [m'] ""
 
   allInstalled DeviceConfig{ deviceData = devData } = io $ isJust
     <$> findExecutable (exe devData)
@@ -454,11 +457,11 @@ instance Mountable DeviceConfig where
 mountSSHFS :: FilePath -> String -> IO MountResult
 mountSSHFS mountpoint remote = runMount "sshfs" [remote, mountpoint] ""
 
-mountCIFS :: FilePath -> Maybe PasswordConfig -> IO MountResult
-mountCIFS mountpoint pwdConfig = withPasswordGetter pwdConfig runPwd run
+mountCIFS :: Bool -> FilePath -> Maybe PasswordConfig -> IO MountResult
+mountCIFS useSudo mountpoint pwdConfig = withPasswordGetter pwdConfig runPwd run
   where
-    run = runMount "mount" [mountpoint] ""
-    runPwd p = runMount' "mount" [mountpoint] "" [("PASSWD", p)]
+    run = runMountSudoMaybe useSudo "mount" [mountpoint]
+    runPwd p = runMountSudoMaybe' useSudo "mount" [mountpoint] [("PASSWD", p)]
 
 mountVeracrypt :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
 mountVeracrypt mountpoint pwdConfig volume = 
@@ -593,7 +596,7 @@ instance Mountable MTPFS where
     withTmpMountDir m $ io $ runMount "jmtpfs" [dev, m] ""
 
   mount MTPFS { mtpfsMountpoint = m } True =
-    runAndRemoveDir m $ io $ runMount "nmount" [m] ""
+    runAndRemoveDir m $ io $ runMount "umount" [m] ""
 
   -- | return True always since the list won't even show without jmtpfs
   allInstalled _ = return True
@@ -670,6 +673,26 @@ runMount' :: String -> [String] -> String -> [(String, String)] -> IO MountResul
 runMount' cmd args stdin environ = eitherToMountResult
   <$> readCmdEither' cmd args stdin environ
 
+runMountSudoMaybe :: Bool -> String -> [String] -> IO MountResult
+runMountSudoMaybe useSudo cmd args =
+  runMountSudoMaybe' useSudo cmd args []
+
+runMountSudoMaybe' :: Bool -> String -> [String] -> [(String, String)] -> IO MountResult
+runMountSudoMaybe' useSudo cmd args environ = maybe
+  (runMount' cmd args "" environ)
+  (\r -> runSudoMount' r cmd args environ)
+  =<< if useSudo then readPassword' "Sudo Password" else return Nothing
+
+-- TODO untested
+-- runSudoMount :: String -> String -> [String] -> String -> IO MountResult
+-- runSudoMount rootpass cmd args stdin = runSudoMount' rootpass cmd args stdin []
+
+runSudoMount' :: String -> String -> [String] -> [(String, String)] -> IO MountResult
+runSudoMount' rootpass cmd args environ = runMount "sudo" args' rootpass
+  where
+    args' = ["-S"] ++ environ' ++ [cmd] ++ args
+    environ' = fmap (\(k, v) -> k ++ "=" ++ v) environ
+
 eitherToMountResult :: Either (Int, String, String) String -> MountResult
 eitherToMountResult (Right _) = MountSuccess
 eitherToMountResult (Left (_, _, e)) = MountError e 
@@ -701,12 +724,18 @@ rmDirOnMountError d f = do
   unless (res == MountSuccess) $ rmDirMaybe d
   return res
 
+-- | Run a mount command and create the mountpoint if it does not exist, and
+-- remove the mountpoint if a mount error occurs
 withTmpMountDir :: FilePath -> RofiMountIO MountResult -> RofiMountIO MountResult
 withTmpMountDir m = rmDirOnMountError m
   . bracketOnError_ (mkDirMaybe m) (rmDirMaybe m)
 
+-- | Run an unmount command and remove the mountpoint if no errors occur
 runAndRemoveDir :: FilePath -> RofiMountIO MountResult -> RofiMountIO MountResult
-runAndRemoveDir m f = rmDirOnMountError m $ finally f (rmDirMaybe m)
+runAndRemoveDir m f = do
+  res <- catch f (return . MountError . (displayException :: SomeException -> String))
+  when (res == MountSuccess) $ rmDirMaybe m
+  return res
 
 mkDirMaybe :: FilePath -> RofiMountIO ()
 mkDirMaybe fp = whenInMountDir fp $ io $ createDirectoryIfMissing True fp
