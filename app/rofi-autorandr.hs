@@ -40,11 +40,17 @@ instance RofiConf ARClientConf where
 runPrompt :: [String] -> IO ()
 runPrompt a = do
   let c = ARClientConf a
-  profs <- getAutoRandrProfiles
+  staticProfs <- getAutoRandrProfiles
   runRofiIO c $ selectAction $ emptyMenu
-    { groups = [untitledGroup $ toRofiActions [(p, selectProfile p) | p <- profs]]
+    { groups = [mkGroup "Static" staticProfs, mkGroup "Virtual" virtProfs]
     , prompt = Just "Select Profile"
     }
+  where
+    mkGroup header = titledGroup header . toRofiActions
+      . fmap (\s -> ("  " ++ s, selectProfile s))
+
+virtProfs :: [String]
+virtProfs = ["off", "common", "clone-largest", "horizontal", "vertical"]
 
 -- TODO filter profiles based on which xrandr outputs are actually connected
 getAutoRandrProfiles :: IO [String]
@@ -55,16 +61,10 @@ getAutoRandrProfiles = do
 
 getAutoRandrDir :: IO String
 getAutoRandrDir = do
-  x <- xdgDir
-  res <- doesDirectoryExist x
-  if res then return x else legacyDir
+  c <- getXdgDirectory XdgConfig "autorandr"
+  e <- doesDirectoryExist c
+  if e then return c else appendToHome ".autorandr"
   where
-    xdgDir = do
-      e <- lookupEnv "XDG_CONFIG_HOME"
-      case e of
-        Nothing -> appendToHome "./config/autorandr"
-        Just p  -> return $ p </> "autorandr"
-    legacyDir = appendToHome ".autorandr"
     appendToHome p = (</> p) <$> getHomeDirectory
 
 selectProfile :: String -> RofiIO ARClientConf ()
