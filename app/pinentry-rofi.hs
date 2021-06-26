@@ -9,55 +9,59 @@ module Main where
 import           Data.List
 
 import           Bitwarden.Internal
+import           System.Environment
 import           System.Exit
 
 main :: IO ()
 main = do
+  n <- parseArgs =<< getArgs
   putStrLn "Hello loser"
-  pinentryLoop
+  pinentryLoop n
 
-pinentryLoop :: IO ()
-pinentryLoop = do
+parseArgs :: [String] -> IO String
+parseArgs [n] = return n
+parseArgs _ = do
+  putStrLn "Usage: pinentry-rofi [BWNAME]"
+  exitWith $ ExitFailure 1
+
+pinentryLoop :: String -> IO ()
+pinentryLoop n = do
   c <- getLine
-  processLine $ words c
-  pinentryLoop
+  processLine n $ words c
+  pinentryLoop n
 
-processLine :: [String] -> IO ()
-processLine []                             = noop
-processLine ["BYE"]                        = exitSuccess
-processLine ["GETPIN"]                     = getPin
-
--- TODO this might be important
-processLine ["OPTION", o]                  = processOption o
+processLine :: String -> [String] -> IO ()
+processLine _ []                             = noop
+processLine _ ["BYE"]                        = exitSuccess
+processLine n ["GETPIN"]                     = getPin n
 
 -- TODO this might be important
-processLine ["GETINFO", _]                 = noop
+processLine _ ["OPTION", o]                  = processOption o
+
+-- TODO this might be important
+processLine _ ["GETINFO", _]                 = noop
 
 -- these all take one arg and should do nothing here
-processLine ["SETDESC", _]                 = noop
-processLine ["SETOK", _]                   = noop
-processLine ["SETNOTOK", _]                = noop
-processLine ["SETCANCEL", _]               = noop
-processLine ["SETPROMPT", _]               = noop
-processLine ["SETERROR", _]                = noop
+processLine _ ["SETDESC", _]                 = noop
+processLine _ ["SETOK", _]                   = noop
+processLine _ ["SETNOTOK", _]                = noop
+processLine _ ["SETCANCEL", _]               = noop
+processLine _ ["SETPROMPT", _]               = noop
+processLine _ ["SETERROR", _]                = noop
 
 -- CONFIRM can take a flag
-processLine ["CONFIRM"]                    = noop
-processLine ["CONFIRM", "--one-button", _] = noop
+processLine _ ["CONFIRM"]                    = noop
+processLine _ ["CONFIRM", "--one-button", _] = noop
 
-processLine ss                             = unknownCommand $ unwords ss
+processLine _ ss                             = unknownCommand $ unwords ss
 
 unknownCommand :: String -> IO ()
 unknownCommand c = putStrLn $ "ERR 275 Unknown command " ++ c
 
--- TODO make this a CLI arg
-gpgname :: String
-gpgname = "password name"
-
-getPin :: IO ()
-getPin = do
+getPin :: String -> IO ()
+getPin n = do
   its <- getItems
-  let p = (password . login) =<< find (\i -> gpgname == name i) its
+  let p = (password . login) =<< find (\i -> n == name i) its
   maybe err printPin p
   where
     err = putStrLn "ERR 83886179 Operation canceled <rofi>"
