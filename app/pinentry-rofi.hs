@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 --------------------------------------------------------------------------------
 -- | rofi-pinentry - a simply pinentry proxy for bitwarden
 --
@@ -6,31 +8,52 @@
 
 module Main where
 
-import           Data.List
-
 import           Bitwarden.Internal
+
+import           Data.List
+import           Data.Yaml
+
+import           System.Directory
+import           System.Environment
 import           System.Exit
+import           System.FilePath.Posix
 import           System.IO
 import           System.Posix.Process
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  -- TODO don't hardcode this
-  let n = "gnupg"
   putStrLn "OK Pleased to meet you"
-  pinentryLoop n
+  pinentryLoop =<< readPinConf
 
-pinentryLoop :: String -> IO ()
-pinentryLoop n = do
-  c <- getLine
-  processLine n $ words c
-  pinentryLoop n
+newtype PinConf = PinConf { pcBwName :: String } deriving (Eq, Show)
 
-processLine :: String -> [String] -> IO ()
+instance FromJSON PinConf where
+  parseJSON (Object o) = PinConf <$> o .:? "bitwarden-name" .!= "gnupg"
+  parseJSON _          = fail "pinentry yaml parse error"
+
+readPinConf :: IO PinConf
+readPinConf = do
+  c <- decodeFileEither =<< pinConfDir
+  case c of
+    Left e  -> print e >> exitWith (ExitFailure 1)
+    Right r -> return r
+
+pinConfDir :: IO FilePath
+pinConfDir = maybe defHome (return . (</> confname)) =<< lookupEnv "GNUPGHOME"
+  where
+    defHome = (</> ".gnupg" </> confname) <$> getHomeDirectory
+    confname = "pinentry-rofi.yml"
+
+pinentryLoop :: PinConf -> IO ()
+pinentryLoop p = do
+  processLine p . words =<< getLine
+  pinentryLoop p
+
+processLine :: PinConf -> [String] -> IO ()
 processLine _ []                             = noop
 processLine _ ["BYE"]                        = exitSuccess
-processLine n ["GETPIN"]                     = getPin n
+processLine p ["GETPIN"]                     = getPin p
 
 processLine _ ["GETINFO", o]                 = processGetInfo o
 
@@ -54,11 +77,11 @@ processLine _ ss                             = unknownCommand $ unwords ss
 unknownCommand :: String -> IO ()
 unknownCommand c = putStrLn $ "ERR 275 Unknown command " ++ c
 
-getPin :: String -> IO ()
-getPin n = do
+getPin :: PinConf -> IO ()
+getPin p = do
   its <- getItems
-  let p = (password . login) =<< find (\i -> n == name i) its
-  maybe err send p
+  let w = (password . login) =<< find (\i -> pcBwName p == name i) its
+  maybe err send w
   where
     err = putStrLn "ERR 83886179 Operation canceled <rofi>"
 
