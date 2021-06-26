@@ -51,6 +51,15 @@ library:
   - Rofi.Command
 
 executables:
+  pinentry-rofi:
+    main: pinentry-rofi.hs
+    source-dirs: app
+    ghc-options:
+    - -Wall
+    - -Werror
+    - -threaded
+    dependencies:
+    - rofi-extras
   rofi-autorandr:
     main: rofi-autorandr.hs
     source-dirs: app
