@@ -9,20 +9,17 @@ module Main where
 import           Data.List
 
 import           Bitwarden.Internal
-import           System.Environment
 import           System.Exit
+import           System.IO
+import           System.Posix.Process
 
 main :: IO ()
 main = do
-  n <- parseArgs =<< getArgs
-  putStrLn "Hello loser"
+  hSetBuffering stdout LineBuffering
+  -- TODO don't hardcode this
+  let n = "gnupg"
+  putStrLn "OK Pleased to meet you"
   pinentryLoop n
-
-parseArgs :: [String] -> IO String
-parseArgs [n] = return n
-parseArgs _ = do
-  putStrLn "Usage: pinentry-rofi [BWNAME]"
-  exitWith $ ExitFailure 1
 
 pinentryLoop :: String -> IO ()
 pinentryLoop n = do
@@ -35,19 +32,18 @@ processLine _ []                             = noop
 processLine _ ["BYE"]                        = exitSuccess
 processLine n ["GETPIN"]                     = getPin n
 
+processLine _ ["GETINFO", o]                 = processGetInfo o
+
 -- TODO this might be important
 processLine _ ["OPTION", o]                  = processOption o
 
--- TODO this might be important
-processLine _ ["GETINFO", _]                 = noop
-
--- these all take one arg and should do nothing here
-processLine _ ["SETDESC", _]                 = noop
-processLine _ ["SETOK", _]                   = noop
-processLine _ ["SETNOTOK", _]                = noop
-processLine _ ["SETCANCEL", _]               = noop
-processLine _ ["SETPROMPT", _]               = noop
-processLine _ ["SETERROR", _]                = noop
+-- these should all do nothing
+processLine _ ("SETDESC":_)                  = noop
+processLine _ ("SETOK":_)                    = noop
+processLine _ ("SETNOTOK":_)                 = noop
+processLine _ ("SETCANCEL":_)                = noop
+processLine _ ("SETPROMPT":_)                = noop
+processLine _ ("SETERROR":_)                 = noop
 
 -- CONFIRM can take a flag
 processLine _ ["CONFIRM"]                    = noop
@@ -62,13 +58,23 @@ getPin :: String -> IO ()
 getPin n = do
   its <- getItems
   let p = (password . login) =<< find (\i -> n == name i) its
-  maybe err printPin p
+  maybe err send p
   where
     err = putStrLn "ERR 83886179 Operation canceled <rofi>"
-    printPin p = putStrLn ("D " ++ p) >> ok
+
+-- these are the only supported options for GETINFO; anything else is an error
+processGetInfo :: String -> IO ()
+processGetInfo "pid"     = send . show =<< getProcessID
+processGetInfo "version" = noop
+processGetInfo "flavor"  = noop
+processGetInfo "ttyinfo" = noop
+processGetInfo _         = putStrLn "ERR 83886360 IPC parameter error <rofi>"
 
 processOption :: String -> IO ()
-processOption = undefined
+processOption _ = noop
+
+send :: String -> IO ()
+send s = putStrLn ("D " ++ s) >> ok
 
 noop :: IO ()
 noop = ok
