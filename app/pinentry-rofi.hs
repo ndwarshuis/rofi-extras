@@ -6,6 +6,9 @@
 
 module Main where
 
+import           Data.List
+
+import           Bitwarden.Internal
 import           System.Exit
 
 main :: IO ()
@@ -47,8 +50,18 @@ processLine ss                             = unknownCommand $ unwords ss
 unknownCommand :: String -> IO ()
 unknownCommand c = putStrLn $ "ERR 275 Unknown command " ++ c
 
+-- TODO make this a CLI arg
+gpgname :: String
+gpgname = "password name"
+
 getPin :: IO ()
-getPin = undefined
+getPin = do
+  its <- getItems
+  let p = (password . login) =<< find (\i -> gpgname == name i) its
+  maybe err printPin p
+  where
+    err = putStrLn "ERR 83886179 Operation canceled <rofi>"
+    printPin p = putStrLn ("D " ++ p) >> ok
 
 processOption :: String -> IO ()
 processOption = undefined
