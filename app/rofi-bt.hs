@@ -18,20 +18,20 @@ import           DBus.Client
 
 import           Rofi.Command
 
-main :: IO ()
-main = runPrompt
+import           System.Environment
 
--- dummy type with nothing in it since there is nothing to configure for this
--- (yet)
-newtype RofiBTConf = RofiBTConf ObjectPath
+main :: IO ()
+main = getArgs >>= runPrompt
+
+data RofiBTConf = RofiBTConf [String] ObjectPath
 
 instance RofiConf RofiBTConf where
-  defArgs (RofiBTConf _) = []
+  defArgs (RofiBTConf as _) = as
 
 type BTAction = RofiAction RofiBTConf
 
-runPrompt :: IO ()
-runPrompt = do
+runPrompt :: [String] -> IO ()
+runPrompt args = do
   c <- getClient
   maybe (putStrLn "could not get DBus client") run c
   where
@@ -41,7 +41,7 @@ runPrompt = do
         $ getAdapter paths
     actions client paths adapter = do
       ras <- getRofiActions client paths
-      runRofiIO (RofiBTConf adapter) $ selectAction $ emptyMenu
+      runRofiIO (RofiBTConf args adapter) $ selectAction $ emptyMenu
         { groups = [untitledGroup $ toRofiActions ras]
         , prompt = Just "Select Device"
         }
@@ -66,7 +66,7 @@ deviceToRofiAction client dev = do
 
 powerAdapterMaybe :: Client -> RofiIO RofiBTConf ()
 powerAdapterMaybe client = do
-  (RofiBTConf adapter) <- ask
+  (RofiBTConf _ adapter) <- ask
   let mc = btMethodCall adapter i m
   let powerOnMaybe = flip unless $ void $ setProperty client mc value
   powered <- io $ getBTProperty client adapter i m
