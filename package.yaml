@@ -60,6 +60,7 @@ executables:
     - -threaded
     dependencies:
     - rofi-extras
+
   rofi-autorandr:
     main: rofi-autorandr.hs
     source-dirs: app
@@ -69,6 +70,7 @@ executables:
     - -threaded
     dependencies:
     - rofi-extras
+
   rofi-bw:
     main: rofi-bw.hs
     source-dirs: app
@@ -78,6 +80,17 @@ executables:
     - -threaded
     dependencies:
     - rofi-extras
+
+  rofi-bt:
+    main: rofi-bt.hs
+    source-dirs: app
+    ghc-options:
+    - -Wall
+    - -Werror
+    - -threaded
+    dependencies:
+    - rofi-extras
+
   rofi-dev:
     main: rofi-dev.hs
     source-dirs: app
@@ -87,6 +100,7 @@ executables:
     - -threaded
     dependencies:
     - rofi-extras
+
   current-output:
     main: current-output.hs
     source-dirs: app
