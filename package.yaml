@@ -101,6 +101,16 @@ executables:
     dependencies:
     - rofi-extras
 
+  rofi-evpn:
+    main: rofi-evpn.hs
+    source-dirs: app
+    ghc-options:
+    - -Wall
+    - -Werror
+    - -threaded
+    dependencies:
+    - rofi-extras
+
   current-output:
     main: current-output.hs
     source-dirs: app
