@@ -1,5 +1,5 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 --------------------------------------------------------------------------------
 -- | rofi-dev - a rofi prompt for mountable devices
@@ -19,8 +19,8 @@ import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
 import           Data.Maybe
-import qualified Data.Text as T
-import qualified Data.Vector as V
+import qualified Data.Text             as T
+import qualified Data.Vector           as V
 import           Data.Yaml
 
 import           Rofi.Command
@@ -259,7 +259,7 @@ defaultTries = 2
 
 data MountConfig = MountConfig
   { mountMountpoint :: FilePath
-  , mountLabel :: Maybe String
+  , mountLabel      :: Maybe String
   } deriving Show
 
 instance FromJSON MountConfig where
@@ -268,7 +268,7 @@ instance FromJSON MountConfig where
     <*> o .:? "label"
 
 data BitwardenConfig = BitwardenConfig
-  { bitwardenKey :: String
+  { bitwardenKey   :: String
   , bitwardenTries :: Integer }
   deriving Show
 
@@ -290,27 +290,27 @@ newtype PromptConfig = PromptConfig
   deriving Show
 
 instance FromJSON PromptConfig where
-  parseJSON = withObject "libsecret" $ \o -> PromptConfig
-    <$> o .: "tries" .!= defaultTries
+  parseJSON = withObject "prompt" $ \o -> PromptConfig
+    <$> o .:? "tries" .!= defaultTries
 
-data PasswordConfig = PasswordConfig
-  { passwordBitwarden :: Maybe BitwardenConfig
-  , passwordLibSecret :: Maybe LibSecretConfig
-  , passwordPrompt    :: Maybe PromptConfig
-  }
+data PasswordConfig = PwdBW BitwardenConfig
+  | PwdLS LibSecretConfig
+  | PwdPr PromptConfig
   deriving Show
 
 instance FromJSON PasswordConfig where
-  parseJSON = withObject "password" $ \o -> PasswordConfig
-    <$> o .:? "bitwarden"
-    <*> o .:? "libsecret"
-    <*> o .:? "prompt"
+  parseJSON = withObject "password" $ \o -> do
+    br <- fmap PwdBW <$> o .:? "bitwarden"
+    ls <- maybe (fmap PwdLS <$> o .:? "libsecret") (return . Just) br
+    -- TODO this is silly because I need to pass 'prompt: {}' instead of
+    -- just 'prompt:' if I just want the defaults
+    maybe (PwdPr <$> o .: "prompt") return ls
 
 data CIFSOptsConfig = CIFSOptsConfig
-  { cifsoptsUsername   :: Maybe String
-  , cifsoptsWorkgroup  :: Maybe String
-  , cifsoptsUID        :: Maybe Integer
-  , cifsoptsGID        :: Maybe Integer
+  { cifsoptsUsername  :: Maybe String
+  , cifsoptsWorkgroup :: Maybe String
+  , cifsoptsUID       :: Maybe Integer
+  , cifsoptsGID       :: Maybe Integer
   , cifsoptsIocharset :: Maybe String
   } deriving Show
 
@@ -326,12 +326,13 @@ data DataConfig = VeracryptConfig
   { veracryptVolume   :: String
   , veracryptPassword :: Maybe PasswordConfig
   } | SSHFSConfig
-  { sshfsRemote :: String
+  { sshfsRemote   :: String
+  , sshfsPassword :: Maybe PasswordConfig
   } | CIFSConfig
-  { cifsRemote     :: String
-  , cifsSudo       :: Bool
-  , cifsPassword   :: Maybe PasswordConfig
-  , cifsOpts       :: Maybe CIFSOptsConfig
+  { cifsRemote   :: String
+  , cifsSudo     :: Bool
+  , cifsPassword :: Maybe PasswordConfig
+  , cifsOpts     :: Maybe CIFSOptsConfig
   } deriving Show
 
 data DeviceConfig = DeviceConfig
@@ -357,6 +358,7 @@ instance FromJSON TreeConfig where
                    <*> o .:? "options"
                  "sshfs"     -> SSHFSConfig
                    <$> o .: "remote"
+                   <*> o .:? "password"
                  "veracrypt" -> VeracryptConfig
                    <$> o .: "volume"
                    <*> o .:? "password"
@@ -398,7 +400,7 @@ type StaticConfigTree = Tree DeviceConfig
 
 instance Mountable a => Mountable (Tree a) where
   mount (Tree p cs) False = mapM_ (`mountMaybe` False) cs >> mount p False
-  mount (Tree p _) True = mount p True
+  mount (Tree p _) True   = mount p True
 
   isMounted (Tree p _) = isMounted p
 
@@ -409,16 +411,16 @@ instance Mountable a => Mountable (Tree a) where
   getLabel (Tree p _) = getLabel p
 
 instance Actionable (Tree DeviceConfig) where
-  fmtEntry (Tree p@DeviceConfig{ deviceData = d } _) = [getLabel p, target d] 
+  fmtEntry (Tree p@DeviceConfig{ deviceData = d } _) = [getLabel p, target d]
     where
-      target CIFSConfig{ cifsRemote = r } = r
-      target SSHFSConfig{ sshfsRemote = r } = r
+      target CIFSConfig{ cifsRemote = r }           = r
+      target SSHFSConfig{ sshfsRemote = r }         = r
       target VeracryptConfig{ veracryptVolume = v } = v
 
   groupHeader (Tree DeviceConfig{ deviceData = d } _) =
     case d of
-      CIFSConfig{} -> CIFSHeader
-      SSHFSConfig{} -> SSHFSHeader
+      CIFSConfig{}      -> CIFSHeader
+      SSHFSConfig{}     -> SSHFSHeader
       VeracryptConfig{} -> VeracryptHeader
 
 configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
@@ -446,7 +448,7 @@ instance Mountable DeviceConfig where
     withTmpMountDir m'
       $ io
       $ case devData of
-          SSHFSConfig{ sshfsRemote = r } -> mountSSHFS m' r
+          SSHFSConfig{ sshfsRemote = r, sshfsPassword = p } -> mountSSHFS m' p r
           CIFSConfig
             { cifsRemote = r
             , cifsSudo = s
@@ -459,15 +461,15 @@ instance Mountable DeviceConfig where
   mount DeviceConfig{ deviceMount = m, deviceData = d } True = do
     m' <- getAbsMountpoint m
     runAndRemoveDir m' $ io $ case d of
-      CIFSConfig{ cifsSudo = s } -> runMountSudoMaybe s "umount" [m'] 
+      CIFSConfig{ cifsSudo = s } -> runMountSudoMaybe s "umount" [m']
       VeracryptConfig{}          -> runVeraCrypt ["-d", m'] ""
       _                          -> runMount "umount" [m'] ""
 
   allInstalled DeviceConfig{ deviceData = devData } = io $ isJust
     <$> findExecutable (exe devData)
     where
-      exe SSHFSConfig{} = "sshfs"
-      exe CIFSConfig{} = "mount.cifs"
+      exe SSHFSConfig{}     = "sshfs"
+      exe CIFSConfig{}      = "mount.cifs"
       exe VeracryptConfig{} = "veracrypt"
 
   isMounted DeviceConfig{ deviceMount = m } =
@@ -477,10 +479,13 @@ instance Mountable DeviceConfig where
     { deviceMount = MountConfig { mountMountpoint = p, mountLabel = l }
     } = fromMaybe (takeFileName p) l
 
-mountSSHFS :: FilePath -> String -> IO MountResult
-mountSSHFS mountpoint remote = runMount "sshfs" [remote, mountpoint] ""
+mountSSHFS :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
+mountSSHFS mountpoint pwdConfig remote =
+  withPasswordGetter pwdConfig (run ["-o", "password_stdin"]) $ run [] ""
+  where
+    run other = runMount "sshfs" (other ++ [remote, mountpoint])
 
-mountCIFS :: Bool -> String -> FilePath -> Maybe CIFSOptsConfig 
+mountCIFS :: Bool -> String -> FilePath -> Maybe CIFSOptsConfig
   -> Maybe PasswordConfig -> IO MountResult
 mountCIFS useSudo remote mountpoint opts pwdConfig =
   withPasswordGetter pwdConfig runPwd run
@@ -501,7 +506,7 @@ fromCIFSOpts o = intercalate "," $ mapMaybe concatMaybe fs
     concatMaybe (k, f) = (\v -> k ++ "=" ++ v) <$> f o
 
 mountVeracrypt :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
-mountVeracrypt mountpoint pwdConfig volume = 
+mountVeracrypt mountpoint pwdConfig volume =
   withPasswordGetter pwdConfig (runVeraCrypt (args ++ ["--stdin"]))
   $ runVeraCrypt args ""
   where
@@ -519,7 +524,7 @@ getAbsMountpoint MountConfig{ mountMountpoint = m } =
   asks $ flip appendRoot m . mountconfVolatilePath
 
 getStaticActions :: RofiMountIO [(Header, ProtoAction [String])]
-getStaticActions = mountableToAction $ asks $ configToTree' . mountconfStaticDevs 
+getStaticActions = mountableToAction $ asks $ configToTree' . mountconfStaticDevs
 
 --------------------------------------------------------------------------------
 -- | Password-getting functions for static devices
@@ -529,7 +534,7 @@ type PasswordGetter = IO (Maybe String)
 runSecret :: M.Map String String -> PasswordGetter
 runSecret kvs = readCmdSuccess "secret-tool" ("lookup":kvs') ""
   where
-    kvs' = concatMap (\(k, v) -> [k, v]) $ M.toList kvs 
+    kvs' = concatMap (\(k, v) -> [k, v]) $ M.toList kvs
 
 runBitwarden :: String -> PasswordGetter
 runBitwarden pname = ((password . login) <=< find (\i -> name i == pname))
@@ -542,20 +547,26 @@ runPromptLoop n pwd = do
     if n <= 0 then return Nothing else runPromptLoop (n-1) pwd
     else return res
 
+-- configToPwd :: PasswordConfig -> PasswordGetter
+-- configToPwd PasswordConfig
+--   { passwordBitwarden = b
+--   , passwordLibSecret = s
+--   , passwordPrompt = p
+--   } =
+--     getBW b `runMaybe` getLS s `runMaybe` getPrompt p
+--   where
+--     getBW (Just BitwardenConfig{ bitwardenKey = k, bitwardenTries = n }) =
+--       runPromptLoop n $ runBitwarden k
+--     getBW _ = return Nothing
+--     getLS = maybe (return Nothing) (runSecret . libsecretAttributes)
+--     getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . promptTries)
+--     runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
+
 configToPwd :: PasswordConfig -> PasswordGetter
-configToPwd PasswordConfig
-  { passwordBitwarden = b
-  , passwordLibSecret = s
-  , passwordPrompt = p
-  } =
-    getBW b `runMaybe` getLS s `runMaybe` getPrompt p
-  where
-    getBW (Just BitwardenConfig{ bitwardenKey = k, bitwardenTries = n }) =
-      runPromptLoop n $ runBitwarden k
-    getBW _ = return Nothing
-    getLS = maybe (return Nothing) (runSecret . libsecretAttributes)
-    getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . promptTries)
-    runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
+configToPwd (PwdBW (BitwardenConfig { bitwardenKey = k, bitwardenTries = n })) =
+  runPromptLoop n $ runBitwarden k
+configToPwd (PwdLS s) = runSecret $ libsecretAttributes s
+configToPwd (PwdPr p) = flip runPromptLoop readPassword $ promptTries p
 
 withPasswordGetter :: Maybe PasswordConfig -> (String -> IO MountResult)
   -> IO MountResult -> IO MountResult
@@ -683,7 +694,7 @@ data NotifyIcon = IconError | IconInfo
 
 instance Show NotifyIcon where
   show IconError = "dialog-error-symbolic"
-  show IconInfo = "dialog-information-symbolic"
+  show IconInfo  = "dialog-information-symbolic"
 
 notifyMountResult :: Bool -> String -> MountResult -> IO ()
 notifyMountResult mounted label result = case result of
@@ -731,8 +742,8 @@ runSudoMount' rootpass cmd args environ = runMount "sudo" args' rootpass
     environ' = fmap (\(k, v) -> k ++ "=" ++ v) environ
 
 eitherToMountResult :: Either (Int, String, String) String -> MountResult
-eitherToMountResult (Right _) = MountSuccess
-eitherToMountResult (Left (_, _, e)) = MountError e 
+eitherToMountResult (Right _)        = MountSuccess
+eitherToMountResult (Left (_, _, e)) = MountError e
 
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
