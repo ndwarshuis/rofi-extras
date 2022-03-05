@@ -6,6 +6,7 @@ module Main (main) where
 
 import           Control.Monad
 
+import           Data.List          (isPrefixOf)
 import           Data.List.Split
 import           Data.Maybe
 
@@ -59,10 +60,11 @@ getStatus = do
 getConnectedServer :: IO (Maybe String)
 getConnectedServer = (procStatus =<<) <$> readCmdSuccess eVPN ["status"] ""
   where
-    procStatus s = case words <$> lines s of
+    procStatus = listToMaybe . mapMaybe procLine . lines
+    procLine l = case words l of
       -- the output is green...
-      (("\ESC[1;32;49mConnected":"to":server):_) -> Just $ unwords server
-      _                                          -> Nothing
+      ("\ESC[1;32;49mConnected":"to":server) -> Just $ unwords server
+      _                                      -> Nothing
 
 getAvailableServers :: IO [VPNServer]
 getAvailableServers = procOut =<< readCmdSuccess eVPN ["ls"] ""
@@ -70,13 +72,15 @@ getAvailableServers = procOut =<< readCmdSuccess eVPN ["ls"] ""
     procOut Nothing   = do
       notify IconError "failed to get list of servers"
       return []
-    -- ASSUME the output has a header that has three lines, followed by the
-    -- stuff we care about, which is followed by a blank line (after which there
-    -- is other stuff that doesn't matter based on the way I'm parsing below)
+    -- ASSUME the output has a useless header that ends in a line that starts
+    -- with "-----", after which is the stuff we care about, which is followed
+    -- by a blank line, after which there is more stuff I don't care about
     procOut (Just ls) = return
       $ mapMaybe (matchLine . splitOn "\t")
-      $ drop 3
       $ takeWhile (/= "")
+      $ drop 1
+      -- super lame way of matching lines that start with "-----"
+      $ dropWhile (not . isPrefixOf "-----")
       $ lines ls
     -- The output of this command is very strange; it is delimited (kinda) by
     -- tabs but some lines are long enough that they don't have a tab. In
