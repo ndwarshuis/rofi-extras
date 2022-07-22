@@ -39,6 +39,7 @@ dependencies:
 - X11 >= 1.9.1
 - yaml >= 0.11.1.2
 - vector >= 0.12.0.3
+- bimap >= 0.2.4
 
 library:
   source-dirs: lib/

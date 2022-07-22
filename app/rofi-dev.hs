@@ -161,6 +161,12 @@ instance RofiConf MountConf where
 --
 -- Class to provide common interface for anything that can be mounted.
 
+data MountState = Unmounted | Mounted | Partial deriving (Show, Eq)
+
+mountedState :: MountState -> Bool
+mountedState Mounted = True
+mountedState _       = False
+
 class Mountable a where
   -- | Mount the given type (or dismount if False is passed)
   mount :: a -> Bool -> RofiMountIO MountResult
@@ -183,6 +189,9 @@ class Mountable a where
 
   -- | Determine if the given type is mounted or not
   isMounted :: a -> RofiMountIO Bool
+  isMounted dev = mountedState <$> mountState dev
+
+  mountState :: a -> RofiMountIO MountState
 
 --------------------------------------------------------------------------------
 -- | Actionable typeclass
@@ -204,18 +213,19 @@ class Mountable a => Actionable a where
   -- Rofi prompt and an action to perform when it is selected)
   mkAction :: a -> RofiMountIO (Header, ProtoAction [String])
   mkAction dev = do
-    m <- isMounted dev
+    m <- mountState dev
     i <- allInstalled dev
     let h = groupHeader dev
-    let action = when i $ mountMaybe dev m
+    let action = when i $ mountMaybe dev $ mountedState m
     let entry = case fmtEntry dev of
               (e:es) -> (mountedPrefix m i ++ e):es
               _      -> []
     return (h, ProtoAction entry action)
     where
-      mountedPrefix False True = "  "
-      mountedPrefix True True  = "* "
-      mountedPrefix _ False    = "! "
+      mountedPrefix _ False        = "! "
+      mountedPrefix Unmounted True = "  "
+      mountedPrefix Mounted True   = "* "
+      mountedPrefix Partial True   = "- "
 
 mountableToAction :: Actionable a => RofiMountIO [a] -> RofiMountIO [(Header, ProtoAction [String])]
 mountableToAction ms = mapM mkAction =<< ms
@@ -402,7 +412,7 @@ instance Mountable a => Mountable (Tree a) where
   mount (Tree p cs) False = mapM_ (`mountMaybe` False) cs >> mount p False
   mount (Tree p _) True   = mount p True
 
-  isMounted (Tree p _) = isMounted p
+  mountState (Tree p _) = mountState p
 
   allInstalled (Tree p cs) = do
     res <- and <$> mapM allInstalled cs
@@ -472,8 +482,13 @@ instance Mountable DeviceConfig where
       exe CIFSConfig{}      = "mount.cifs"
       exe VeracryptConfig{} = "veracrypt"
 
-  isMounted DeviceConfig{ deviceMount = m } =
-    (io . isDirMounted) =<< getAbsMountpoint m
+  mountState DeviceConfig{ deviceMount = m, deviceData = d } = do
+  -- mountState DeviceConfig{ deviceMount = m } = do
+    case d of
+      VeracryptConfig{} -> veracryptMountState m
+      _                 -> do
+        b <- (io . isDirMounted) =<< getAbsMountpoint m
+        return $ if b then Mounted else Unmounted
 
   getLabel DeviceConfig
     { deviceMount = MountConfig { mountMountpoint = p, mountLabel = l }
@@ -518,6 +533,23 @@ runVeraCrypt :: [String] -> String -> IO MountResult
 runVeraCrypt args = runMount "sudo" (defaultArgs ++ args)
   where
     defaultArgs = ["/usr/bin/veracrypt", "--text", "--non-interactive"]
+
+veracryptMountState :: MountConfig -> RofiMountIO MountState
+veracryptMountState mc = do
+  mp <- getAbsMountpoint mc
+  primary <- io $ lookupSpec mp
+  aux <- io $ fmap join $ mapM lookupSpec $ auxPath =<< primary
+  return $ case (primary, aux) of
+    (Just _, Just _)   -> Mounted
+    (Nothing, Nothing) -> Unmounted
+    _                  -> Partial
+  where
+    -- TODO don't hardcode the tmp directory
+    auxPath = fmap (\i -> "/tmp/.veracrypt_aux_mnt" ++ [i]) . vcIndex
+    vcIndex spec = case reverse spec of
+      -- TODO what if I have more than one digit?
+      (i:_) -> if i `elem` ['0'..'9'] then Just i else Nothing
+      _     -> Nothing
 
 getAbsMountpoint :: MountConfig -> RofiMountIO FilePath
 getAbsMountpoint MountConfig{ mountMountpoint = m } =
@@ -596,7 +628,9 @@ instance Mountable Removable where
 
   allInstalled _ = fmap isJust $ io $ findExecutable "udisksctl"
 
-  isMounted Removable { removablePath = d } = elem d <$> io curDeviceSpecs
+  mountState Removable { removablePath = d } = do
+    s <- elem d <$> io curDeviceSpecs
+    return $ if s then Mounted else Unmounted
 
   getLabel Removable { removableLabel = l } = l
 
@@ -649,7 +683,9 @@ instance Mountable MTPFS where
   -- | return True always since the list won't even show without jmtpfs
   allInstalled _ = return True
 
-  isMounted = io . isDirMounted <$> mtpfsMountpoint
+  mountState MTPFS { mtpfsMountpoint = m } = do
+    s <- io $ isDirMounted m
+    return $ if s then Mounted else Unmounted
 
   getLabel = mtpfsDescription
 
@@ -748,16 +784,23 @@ eitherToMountResult (Left (_, _, e)) = MountError e
 --------------------------------------------------------------------------------
 -- | Low-level mount functions
 
--- ASSUME these will never fail because the format of /proc/mounts is fixed
-
-curMountField :: Int -> IO [String]
-curMountField i = fmap ((!! i) . words) . lines <$> readFile "/proc/mounts"
+mountMap :: IO (M.Map FilePath String)
+mountMap = do
+  parseFile <$> readFile "/proc/mounts"
+  where
+    parseFile = M.fromList . mapMaybe (parseLine . words) . lines
+    -- none of these should fail since this file format will never change
+    parseLine [spec, mountpoint, _, _, _, _] = Just (mountpoint, spec)
+    parseLine _                              = Nothing
 
 curDeviceSpecs :: IO [String]
-curDeviceSpecs = curMountField 0
+curDeviceSpecs = M.elems <$> mountMap
 
 curMountpoints :: IO [String]
-curMountpoints = curMountField 1
+curMountpoints = M.keys <$> mountMap
+
+lookupSpec :: FilePath -> IO (Maybe String)
+lookupSpec mountpoint = M.lookup mountpoint <$> mountMap
 
 -- ASSUME the base mount path will always be created because
 -- 'createDirectoryIfMissing' will make parents if missing, and that removing
