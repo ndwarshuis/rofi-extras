@@ -663,6 +663,9 @@ getRemovableActions = mountableToAction getRemovableDevices
 --------------------------------------------------------------------------------
 -- | MTP devices
 
+mtpExe :: String
+mtpExe = "jmtpfs"
+
 data MTPFS = MTPFS
     { mtpfsBus         :: String
     , mtpfsDevice      :: String
@@ -675,7 +678,7 @@ instance Mountable MTPFS where
   mount MTPFS { mtpfsBus = b, mtpfsDevice = n, mtpfsMountpoint = m } False = do
     -- TODO add autodismount to options
     let dev = "-device=" ++ b ++ "," ++ n
-    withTmpMountDir m $ io $ runMount "jmtpfs" [dev, m] ""
+    withTmpMountDir m $ io $ runMount mtpExe [dev, m] ""
 
   mount MTPFS { mtpfsMountpoint = m } True =
     runAndRemoveDir m $ io $ runMount "umount" [m] ""
@@ -692,10 +695,13 @@ instance Mountable MTPFS where
 -- | Return list of all available MTP devices
 getMTPDevices :: RofiMountIO [MTPFS]
 getMTPDevices = do
-  dir <- asks mountconfVolatilePath
-  res <- io $ readProcess "jmtpfs" ["-l"] ""
-  return $ fromLines (toDev dir) $ toDevList res
+  i <- io mtpExeInstalled
+  if i then go else return []
   where
+    go = do
+      dir <- asks mountconfVolatilePath
+      res <- io $ readProcess mtpExe ["-l"] ""
+      return $ fromLines (toDev dir) $ toDevList res
     toDevList = reverse
       . takeWhile (not . isPrefixOf "Available devices")
       . reverse
@@ -717,6 +723,9 @@ getMTPDevices = do
 
 getMTPActions :: RofiMountIO [(Header, ProtoAction [String])]
 getMTPActions = mountableToAction getMTPDevices
+
+mtpExeInstalled :: IO Bool
+mtpExeInstalled = isJust <$> findExecutable mtpExe
 
 instance Actionable MTPFS where
   fmtEntry d = [getLabel d]
