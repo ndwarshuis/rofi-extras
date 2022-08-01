@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# Show the Pacman/AUR packages necessary for various components in this repo.
+
+# NOTE: this does not list the build dependencies (x11 and friends)
+
+pkgs=(rofi)
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -a|--autorandr)
+            pkgs=("${pkgs[@]}" autorandr)
+            ;;
+        -b|--bitwarden)
+            pkgs=("${pkgs[@]}" bitwarden-cli libnotify)
+            ;;
+        -d|--devices)
+            pkgs=("${pkgs[@]}" udisks2 cifs-utils veracrypt sshfs jmtpfs \
+                               libnotify libsecret)
+            ;;
+        -B|--bluetooth)
+            pkgs=("${pkgs[@]}" bluez)
+            ;;
+        -e|--expressvpn)
+            pkgs=("${pkgs[@]}" expressvpn libnotify)
+            ;;
+        *)
+            echo "unknown option: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+echo "${pkgs[@]}" | tr ' ' '\n' | sort | uniq

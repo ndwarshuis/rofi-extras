@@ -1,8 +1,0 @@
-#!/bin/bash
-
-# install all dependencies for rofi to run at full capacity
-
-rofi_pkgs=(rofi bitwarden-cli libnotify rofi-greenclip
-           networkmanager-dmenu-git veracrypt sshfs jmtpfs)
-
-yay --needed --noconfirm --norebuild --removemake -S "${rofi_pkgs[@]}"

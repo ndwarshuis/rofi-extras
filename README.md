@@ -55,7 +55,6 @@ Any options after `-c` will be passed to rofi.
 
 ### Dependencies
 - [bitwarden-cli](https://github.com/bitwarden/cli)
-- dbus
 - libnotify: desktop notifications
 
 ## Device Mounting (rofi-dev)
@@ -124,7 +123,6 @@ rofi-dev -p '/media/USER/foo'
 - [jmtpfs](https://github.com/JasonFerrara/jmtpfs): mounting MTP devices
 - libnotify: desktop notifications
 - libsecret: password lookup with `secret-tool`
-- libnotify
 
 ## Autorandr (rofi-autorandr)
 
