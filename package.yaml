@@ -47,6 +47,7 @@ library:
   - -Wall
   - -Werror
   - -threaded
+  - -Wpartial-fields
   exposed-modules:
   - Bitwarden.Internal
   - Rofi.Command
@@ -59,6 +60,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -69,6 +71,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -79,6 +82,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -89,6 +93,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -99,6 +104,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -109,6 +115,7 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras
 
@@ -119,5 +126,6 @@ executables:
     - -Wall
     - -Werror
     - -threaded
+    - -Wpartial-fields
     dependencies:
     - rofi-extras

@@ -332,13 +332,22 @@ instance FromJSON CIFSOptsConfig where
     <*> o .:? "gid"
     <*> o .:? "isocharset"
 
-data DataConfig = VeracryptConfig
+data DataConfig = VeracryptConfig VeracryptData
+  | SSHFSConfig SSHFSData
+  | CIFSConfig CIFSData
+  deriving Show
+
+data VeracryptData = VeracryptData
   { veracryptVolume   :: String
   , veracryptPassword :: Maybe PasswordConfig
-  } | SSHFSConfig
+  } deriving Show
+
+data SSHFSData = SSHFSData
   { sshfsRemote   :: String
   , sshfsPassword :: Maybe PasswordConfig
-  } | CIFSConfig
+  } deriving Show
+
+data CIFSData = CIFSData
   { cifsRemote   :: String
   , cifsSudo     :: Bool
   , cifsPassword :: Maybe PasswordConfig
@@ -361,17 +370,17 @@ instance FromJSON TreeConfig where
     deps <- o .:& "depends"
     mountconf <- o .: "mount"
     devData <- case (devType :: String) of
-                 "cifs"      -> CIFSConfig
+                 "cifs"      -> CIFSConfig <$> (CIFSData
                    <$> o .: "remote"
                    <*> o .:? "sudo" .!= False
                    <*> o .:? "password"
-                   <*> o .:? "options"
-                 "sshfs"     -> SSHFSConfig
+                   <*> o .:? "options")
+                 "sshfs"     -> SSHFSConfig <$> (SSHFSData
                    <$> o .: "remote"
-                   <*> o .:? "password"
-                 "veracrypt" -> VeracryptConfig
+                   <*> o .:? "password")
+                 "veracrypt" -> VeracryptConfig <$> (VeracryptData
                    <$> o .: "volume"
-                   <*> o .:? "password"
+                   <*> o .:? "password")
                  -- TODO make this skip adding an entry to the map rather than
                  -- skipping the map entirely
                  _           -> fail $ "unknown device type: " ++ devType
@@ -423,9 +432,9 @@ instance Mountable a => Mountable (Tree a) where
 instance Actionable (Tree DeviceConfig) where
   fmtEntry (Tree p@DeviceConfig{ deviceData = d } _) = [getLabel p, target d]
     where
-      target CIFSConfig{ cifsRemote = r }           = r
-      target SSHFSConfig{ sshfsRemote = r }         = r
-      target VeracryptConfig{ veracryptVolume = v } = v
+      target (CIFSConfig (CIFSData { cifsRemote = r }))                = r
+      target (SSHFSConfig (SSHFSData { sshfsRemote = r }))             = r
+      target (VeracryptConfig (VeracryptData { veracryptVolume = v })) = v
 
   groupHeader (Tree DeviceConfig{ deviceData = d } _) =
     case d of
@@ -458,21 +467,26 @@ instance Mountable DeviceConfig where
     withTmpMountDir m'
       $ io
       $ case devData of
-          SSHFSConfig{ sshfsRemote = r, sshfsPassword = p } -> mountSSHFS m' p r
-          CIFSConfig
-            { cifsRemote = r
-            , cifsSudo = s
-            , cifsPassword = p
-            , cifsOpts = o
-            } -> mountCIFS s r m' o p
-          VeracryptConfig{ veracryptPassword = p, veracryptVolume = v } ->
+          SSHFSConfig (SSHFSData { sshfsRemote = r, sshfsPassword = p }) ->
+            mountSSHFS m' p r
+          CIFSConfig (CIFSData
+                      { cifsRemote = r
+                      , cifsSudo = s
+                      , cifsPassword = p
+                      , cifsOpts = o
+                      }) ->
+            mountCIFS s r m' o p
+          VeracryptConfig (VeracryptData
+                           { veracryptPassword = p
+                           , veracryptVolume = v
+                           }) ->
             mountVeracrypt m' p v
 
   mount DeviceConfig{ deviceMount = m, deviceData = d } True = do
     m' <- getAbsMountpoint m
     runAndRemoveDir m' $ io $ case d of
-      CIFSConfig{ cifsSudo = s } -> runMountSudoMaybe s "umount" [m']
-      VeracryptConfig{}          -> runVeraCrypt ["-d", m'] ""
+      CIFSConfig (CIFSData { cifsSudo = s }) -> runMountSudoMaybe s "umount" [m']
+      VeracryptConfig _          -> runVeraCrypt ["-d", m'] ""
       _                          -> runMount "umount" [m'] ""
 
   allInstalled DeviceConfig{ deviceData = devData } = io $ isJust
