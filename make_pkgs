@@ -1,5 +1,5 @@
 libx11
-libsrandr
+libxrandr
 libxss
 libxext
 zlib
