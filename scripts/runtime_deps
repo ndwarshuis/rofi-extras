@@ -9,20 +9,19 @@ pkgs=(rofi)
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -a|--autorandr)
-            pkgs=("${pkgs[@]}" autorandr)
+            pkgs+=(autorandr)
             ;;
         -b|--bitwarden)
-            pkgs=("${pkgs[@]}" bitwarden-cli libnotify)
+            pkgs+=(bitwarden-cli libnotify)
             ;;
         -d|--devices)
-            pkgs=("${pkgs[@]}" udisks2 cifs-utils veracrypt sshfs jmtpfs \
-                               libnotify libsecret)
+            pkgs+=(udisks2 cifs-utils veracrypt sshfs jmtpfs libnotify libsecret)
             ;;
         -B|--bluetooth)
-            pkgs=("${pkgs[@]}" bluez)
+            pkgs+=(bluez)
             ;;
         -e|--expressvpn)
-            pkgs=("${pkgs[@]}" expressvpn libnotify)
+            pkgs+=(expressvpn libnotify)
             ;;
         *)
             echo "unknown option: $1"
