@@ -22,7 +22,7 @@ module Main (main) where
 --    _NET_DESKTOP_VIEWPORT
 -- 3) Find the name of the xrandr output whose position matches that from (2)
 
-import           Data.Maybe               (catMaybes, maybe)
+import           Data.Maybe
 
 import           Graphics.X11.Types
 import           Graphics.X11.Xlib

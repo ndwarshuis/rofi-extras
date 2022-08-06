@@ -15,11 +15,11 @@ import           Bitwarden.Internal
 import           Control.Monad
 import           Control.Monad.Reader
 
+import           Data.Aeson
 import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
 import           Data.Maybe
-import qualified Data.Text             as T
 import qualified Data.Vector           as V
 import           Data.Yaml
 
@@ -264,7 +264,7 @@ data ProtoAction a = ProtoAction a (RofiMountIO ())
 defaultTries :: Integer
 defaultTries = 2
 
-(.:&) :: FromJSON a => Object -> T.Text -> Parser (V.Vector a)
+(.:&) :: FromJSON a => Object -> Key -> Parser (V.Vector a)
 (.:&) o t = o .:? t .!= V.empty
 
 data MountConfig = MountConfig
