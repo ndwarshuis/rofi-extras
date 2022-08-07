@@ -4,7 +4,6 @@
 {-# LANGUAGE FlexibleInstances  #-}
 {-# LANGUAGE OverloadedStrings  #-}
 
-
 --------------------------------------------------------------------------------
 -- | rofi-dev - a rofi prompt for mountable devices
 --
@@ -16,18 +15,21 @@ module Main (main) where
 
 import           Bitwarden.Internal
 
+-- import           Control.Exception
+import           Control.Lens
 import           Control.Monad
 import           Control.Monad.Reader
 
--- import           Data.Aeson
 import           Data.List
 import           Data.List.Split       (splitOn)
 import qualified Data.Map              as M
 import           Data.Maybe
+import qualified Data.Text             as T
+import           Data.Typeable
 import qualified Data.Vector           as V
--- import           Data.Yaml
 
-import           Dhall                 (FromDhall, Generic, auto, inputFile)
+import           Dhall                 hiding (maybe, sequence, void)
+import qualified Dhall.Map             as DM
 
 import           Rofi.Command
 
@@ -88,9 +90,9 @@ runMounts :: Opts -> IO ()
 runMounts opts = do
   static <- join <$> traverse parseStaticConfig (optsConfig opts)
   defaultTmpPath <- ("/tmp/media" </>) <$> getEffectiveUserName
-  let tmpPath = fromMaybe defaultTmpPath $ staticconfigTmpPath =<< static
-  let staticDevs = maybe M.empty staticconfigDevices static
-  let verbose = fromMaybe False $ staticconfigVerbose =<< static
+  let tmpPath = fromMaybe defaultTmpPath $ scTmpPath =<< static
+  let staticDevs = maybe M.empty scDevices static
+  let verbose = fromMaybe False $ scVerbose =<< static
   let mountconf = MountConf
         { mountconfVolatilePath = tmpPath
         , mountconfRofiArgs = optsRofiArgs opts
@@ -103,12 +105,28 @@ runMounts opts = do
 
 parseStaticConfig :: FilePath -> IO (Maybe StaticConfig)
 parseStaticConfig p = do
-  -- res <- decodeFileEither p
-  res <- inputFile auto p
-  return $ Just (res :: StaticConfig)
-  -- case res of
-  --   Left e  -> print e >> return Nothing
-  --   Right c -> return $ Just c
+  res <- try $ inputFileWithSettings es auto p
+  case res of
+    Left e  -> print (e :: SomeException) >> return Nothing
+    Right c -> return $ Just (c :: StaticConfig)
+  where
+    es = over substitutions (DM.union vars) defaultEvaluateSettings
+    vars = DM.fromList $ catMaybes
+      [ toVar (auto :: Decoder TreeConfig)
+      , toVar (auto :: Decoder DeviceConfig)
+      , toVar (auto :: Decoder DataConfig)
+      , toVar (auto :: Decoder CIFSData)
+      , toVar (auto :: Decoder CIFSOpts)
+      , toVar (auto :: Decoder SSHFSData)
+      , toVar (auto :: Decoder VeracryptData)
+      , toVar (auto :: Decoder PasswordConfig)
+      , toVar (auto :: Decoder PromptConfig)
+      , toVar (auto :: Decoder SecretConfig)
+      , toVar (auto :: Decoder BitwardenConfig)
+      , toVar (auto :: Decoder MountConfig)
+      ]
+    toVar a = fmap (\n -> (T.pack $ show n, maximum $ expected a))
+      $ listToMaybe $ snd $ splitTyConApp $ typeOf a
 
 runPrompt :: RofiConf c => [RofiGroup c] -> RofiIO c ()
 runPrompt gs = selectAction $ emptyMenu
@@ -264,67 +282,32 @@ instance Ord Header where
 data ProtoAction a = ProtoAction a (RofiMountIO ())
 
 --------------------------------------------------------------------------------
--- | Static device configuration
---
--- Static devices are defined in a YAML file. These types/instances describe how
--- to parse said YAML file.
-
--- defaultTries :: Integer
--- defaultTries = 2
-
--- (.:&) :: FromJSON a => Object -> Key -> Parser (V.Vector a)
--- (.:&) o t = o .:? t .!= V.empty
+-- | Static device configuration (dhall)
 
 data MountConfig = MountConfig
-  { mountMountpoint :: FilePath
-  , mountLabel      :: Maybe String
+  { mpPath  :: FilePath
+  , mpLabel :: Maybe String
   } deriving (Show, Generic, FromDhall)
 
--- instance FromJSON MountConfig where
---   parseJSON = withObject "mount" $ \o -> MountConfig
---     <$> o .: "mountpoint"
---     <*> o .:? "label"
-
 data BitwardenConfig = BitwardenConfig
-  { bitwardenKey   :: String
-  , bitwardenTries :: Integer }
+  { bwKey   :: String
+  , bwTries :: Integer }
   deriving (Show, Generic, FromDhall)
 
--- instance FromJSON BitwardenConfig where
---   parseJSON = withObject "bitwarden" $ \o -> BitwardenConfig
---     <$> o .: "key"
---     <*> o .:? "tries" .!= defaultTries
-
-newtype LibSecretConfig = LibSecretConfig
-  { libsecretAttributes :: M.Map String String }
+newtype SecretConfig = SecretConfig
+  { secretAttributes :: M.Map String String }
   deriving (Show, Generic, FromDhall)
-
--- instance FromJSON LibSecretConfig where
---   parseJSON = withObject "libsecret" $ \o -> LibSecretConfig
---     <$> o .: "attributes"
 
 newtype PromptConfig = PromptConfig
   { promptTries :: Integer }
   deriving (Show, Generic, FromDhall)
 
--- instance FromJSON PromptConfig where
---   parseJSON = withObject "prompt" $ \o -> PromptConfig
---     <$> o .:? "tries" .!= defaultTries
-
 data PasswordConfig = PwdBW BitwardenConfig
-  | PwdLS LibSecretConfig
+  | PwdLS SecretConfig
   | PwdPr PromptConfig
   deriving (Show, Generic, FromDhall)
 
--- instance FromJSON PasswordConfig where
---   parseJSON = withObject "password" $ \o -> do
---     br <- fmap PwdBW <$> o .:? "bitwarden"
---     ls <- maybe (fmap PwdLS <$> o .:? "libsecret") (return . Just) br
---     -- TODO this is silly because I need to pass 'prompt: {}' instead of
---     -- just 'prompt:' if I just want the defaults
---     maybe (PwdPr <$> o .: "prompt") return ls
-
-data CIFSOptsConfig = CIFSOptsConfig
+data CIFSOpts = CIFSOpts
   { cifsoptsUsername  :: Maybe String
   , cifsoptsWorkgroup :: Maybe String
   , cifsoptsUID       :: Maybe Integer
@@ -332,22 +315,14 @@ data CIFSOptsConfig = CIFSOptsConfig
   , cifsoptsIocharset :: Maybe String
   } deriving (Show, Generic, FromDhall)
 
--- instance FromJSON CIFSOptsConfig where
---   parseJSON = withObject "options" $ \o -> CIFSOptsConfig
---     <$> o .:? "username"
---     <*> o .:? "workgroup"
---     <*> o .:? "uid"
---     <*> o .:? "gid"
---     <*> o .:? "isocharset"
-
 data DataConfig = VeracryptConfig VeracryptData
   | SSHFSConfig SSHFSData
   | CIFSConfig CIFSData
   deriving (Show, Generic, FromDhall)
 
 data VeracryptData = VeracryptData
-  { veracryptVolume   :: String
-  , veracryptPassword :: Maybe PasswordConfig
+  { vcVolume   :: String
+  , vcPassword :: Maybe PasswordConfig
   } deriving (Show, Generic, FromDhall)
 
 data SSHFSData = SSHFSData
@@ -359,7 +334,7 @@ data CIFSData = CIFSData
   { cifsRemote   :: String
   , cifsSudo     :: Bool
   , cifsPassword :: Maybe PasswordConfig
-  , cifsOpts     :: Maybe CIFSOptsConfig
+  , cifsOpts     :: Maybe CIFSOpts
   } deriving (Show, Generic, FromDhall)
 
 data DeviceConfig = DeviceConfig
@@ -368,49 +343,15 @@ data DeviceConfig = DeviceConfig
   } deriving (Show, Generic, FromDhall)
 
 data TreeConfig = TreeConfig
-  { treeParent         :: DeviceConfig
-  , treeconfigChildren :: V.Vector String
+  { tcParent   :: DeviceConfig
+  , tcChildren :: V.Vector String
   } deriving (Show, Generic, FromDhall)
-
--- instance FromJSON TreeConfig where
---   parseJSON = withObject "devices" $ \o -> do
---     devType <- o .: "type"
---     deps <- o .:& "depends"
---     mountconf <- o .: "mount"
---     devData <- case (devType :: String) of
---                  "cifs"      -> CIFSConfig <$> (CIFSData
---                    <$> o .: "remote"
---                    <*> o .:? "sudo" .!= False
---                    <*> o .:? "password"
---                    <*> o .:? "options")
---                  "sshfs"     -> SSHFSConfig <$> (SSHFSData
---                    <$> o .: "remote"
---                    <*> o .:? "password")
---                  "veracrypt" -> VeracryptConfig <$> (VeracryptData
---                    <$> o .: "volume"
---                    <*> o .:? "password")
---                  -- TODO make this skip adding an entry to the map rather than
---                  -- skipping the map entirely
---                  _           -> fail $ "unknown device type: " ++ devType
---     return $ TreeConfig
---       { treeParent = DeviceConfig
---                       { deviceMount = mountconf
---                       , deviceData = devData
---                       }
---       , treeconfigChildren = deps
---       }
 
 data StaticConfig = StaticConfig
-  { staticconfigTmpPath :: Maybe String
-  , staticconfigVerbose :: Maybe Bool
-  , staticconfigDevices :: M.Map String TreeConfig
+  { scTmpPath :: Maybe String
+  , scVerbose :: Maybe Bool
+  , scDevices :: M.Map String TreeConfig
   } deriving (Show, Generic, FromDhall)
-
--- instance FromJSON StaticConfig where
---   parseJSON = withObject "devices" $ \o -> StaticConfig
---     <$> o .:? "mountdir"
---     <*> o .:? "verbose"
---     <*> o .: "devices"
 
 --------------------------------------------------------------------------------
 -- | Static devices trees
@@ -440,9 +381,9 @@ instance Mountable a => Mountable (Tree a) where
 instance Actionable (Tree DeviceConfig) where
   fmtEntry (Tree p@DeviceConfig{ deviceData = d } _) = [getLabel p, target d]
     where
-      target (CIFSConfig (CIFSData { cifsRemote = r }))                = r
-      target (SSHFSConfig (SSHFSData { sshfsRemote = r }))             = r
-      target (VeracryptConfig (VeracryptData { veracryptVolume = v })) = v
+      target (CIFSConfig (CIFSData { cifsRemote = r }))         = r
+      target (SSHFSConfig (SSHFSData { sshfsRemote = r }))      = r
+      target (VeracryptConfig (VeracryptData { vcVolume = v })) = v
 
   groupHeader (Tree DeviceConfig{ deviceData = d } _) =
     case d of
@@ -454,7 +395,7 @@ configToTree' :: M.Map String TreeConfig -> [StaticConfigTree]
 configToTree' devMap = configToTree devMap <$> M.elems devMap
 
 configToTree :: M.Map String TreeConfig -> TreeConfig -> StaticConfigTree
-configToTree devMap TreeConfig{ treeParent = p, treeconfigChildren = c } =
+configToTree devMap TreeConfig{ tcParent = p, tcChildren = c } =
   Tree p $ fmap go V.toList c
   where
     go ds = configToTree devMap <$> mapMaybe (`M.lookup` devMap) ds
@@ -485,8 +426,8 @@ instance Mountable DeviceConfig where
                       }) ->
             mountCIFS s r m' o p
           VeracryptConfig (VeracryptData
-                           { veracryptPassword = p
-                           , veracryptVolume = v
+                           { vcPassword = p
+                           , vcVolume = v
                            }) ->
             mountVeracrypt m' p v
 
@@ -513,7 +454,7 @@ instance Mountable DeviceConfig where
         return $ if b then Mounted else Unmounted
 
   getLabel DeviceConfig
-    { deviceMount = MountConfig { mountMountpoint = p, mountLabel = l }
+    { deviceMount = MountConfig { mpPath = p, mpLabel = l }
     } = fromMaybe (takeFileName p) l
 
 mountSSHFS :: FilePath -> Maybe PasswordConfig -> String -> IO MountResult
@@ -522,7 +463,7 @@ mountSSHFS mountpoint pwdConfig remote =
   where
     run other = runMount "sshfs" (other ++ [remote, mountpoint])
 
-mountCIFS :: Bool -> String -> FilePath -> Maybe CIFSOptsConfig
+mountCIFS :: Bool -> String -> FilePath -> Maybe CIFSOpts
   -> Maybe PasswordConfig -> IO MountResult
 mountCIFS useSudo remote mountpoint opts pwdConfig =
   withPasswordGetter pwdConfig runPwd run
@@ -531,7 +472,7 @@ mountCIFS useSudo remote mountpoint opts pwdConfig =
     runPwd p = runMountSudoMaybe' useSudo "mount.cifs" args [("PASSWD", p)]
     args = [remote, mountpoint] ++ maybe [] (\o -> ["-o", fromCIFSOpts o]) opts
 
-fromCIFSOpts :: CIFSOptsConfig -> String
+fromCIFSOpts :: CIFSOpts -> String
 fromCIFSOpts o = intercalate "," $ mapMaybe concatMaybe fs
   where
     fs = [ ("username", cifsoptsUsername)
@@ -574,7 +515,7 @@ veracryptMountState mc = do
       _     -> Nothing
 
 getAbsMountpoint :: MountConfig -> RofiMountIO FilePath
-getAbsMountpoint MountConfig{ mountMountpoint = m } =
+getAbsMountpoint MountConfig{ mpPath = m } =
   asks $ flip appendRoot m . mountconfVolatilePath
 
 getStaticActions :: RofiMountIO [(Header, ProtoAction [String])]
@@ -609,17 +550,17 @@ runPromptLoop n pwd = do
 --   } =
 --     getBW b `runMaybe` getLS s `runMaybe` getPrompt p
 --   where
---     getBW (Just BitwardenConfig{ bitwardenKey = k, bitwardenTries = n }) =
+--     getBW (Just BitwardenConfig{ bwKey = k, bwTries = n }) =
 --       runPromptLoop n $ runBitwarden k
 --     getBW _ = return Nothing
---     getLS = maybe (return Nothing) (runSecret . libsecretAttributes)
+--     getLS = maybe (return Nothing) (runSecret . secretAttributes)
 --     getPrompt = maybe (return Nothing) (flip runPromptLoop readPassword . promptTries)
 --     runMaybe x y = (\r -> if isNothing r then y else return r) =<< x
 
 configToPwd :: PasswordConfig -> PasswordGetter
-configToPwd (PwdBW (BitwardenConfig { bitwardenKey = k, bitwardenTries = n })) =
+configToPwd (PwdBW (BitwardenConfig { bwKey = k, bwTries = n })) =
   runPromptLoop n $ runBitwarden k
-configToPwd (PwdLS s) = runSecret $ libsecretAttributes s
+configToPwd (PwdLS s) = runSecret $ secretAttributes s
 configToPwd (PwdPr p) = flip runPromptLoop readPassword $ promptTries p
 
 withPasswordGetter :: Maybe PasswordConfig -> (String -> IO MountResult)

@@ -41,6 +41,7 @@ dependencies:
 - vector >= 0.12.0.3
 - bimap >= 0.2.4
 - dhall >= 1.40.2
+- lens >= 5.0.1
 
 library:
   source-dirs: lib/
