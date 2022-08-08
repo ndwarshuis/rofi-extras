@@ -15,7 +15,6 @@ module Main (main) where
 
 import           Bitwarden.Internal
 
--- import           Control.Exception
 import           Control.Lens
 import           Control.Monad
 import           Control.Monad.Reader

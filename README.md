@@ -21,6 +21,23 @@ stack install
 
 See individual sections for other dependencies to install.
 
+## Putting Rofi on the correct screen (rofi)
+
+This is a total hack...actually it isn't because it's written in Haskell and not
+bash.
+
+The problem is that when used with xmonad, rofi doesn't place itself on the
+"current" workspace since the concept of a "workspace" is weird and specific to
+xmonad. The solution is to use this program to query `_NET_DESKTOP_VIEWPORT`
+(which my xmonad config sets) and use this determine the name of the active
+workspace which can then be fed to rofi using the `-m` flag.
+
+See comments of this binary for details.
+
+### Dependencies
+
+- X11
+
 ## Bitwarden (rofi-bw)
 
 [Bitwarden](https://bitwarden.com/) is an open-source password management server
@@ -174,23 +191,3 @@ bitwarden-name: <name of GPG bitwarden entry>
 ### Dependencies
 
 - rofi-bw (see above): bitwarden integration
-
-## Putting Rofi on the correct screen (current-output)
-
-This is a total hack...actually it isn't because it's written in Haskell and not
-bash.
-
-The problem is that when used with xmonad, rofi doesn't place itself on the
-"current" workspace since the concept of a "workspace" is weird and specific to
-xmonad. The solution is to use this program to query `_NET_DESKTOP_VIEWPORT`
-(which my xmonad config sets) and use this determine the name of the active
-workspace which can then be fed to rofi using the `-m` flag.
-
-See comments of this binary for details.
-
-### Dependencies
-
-- X11
-
-
-

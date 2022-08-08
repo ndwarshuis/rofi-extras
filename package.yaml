@@ -121,8 +121,8 @@ executables:
     dependencies:
     - rofi-extras
 
-  current-output:
-    main: current-output.hs
+  rofi:
+    main: rofi.hs
     source-dirs: app
     ghc-options:
     - -Wall

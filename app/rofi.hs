@@ -1,14 +1,14 @@
 module Main (main) where
 
 --------------------------------------------------------------------------------
--- | Return current xrandr output name
+-- | Run rofi (and display on the correct screen)
 --
 -- Since this seems random, the reason for this is that I want rofi to appear
 -- over the current xmonad workspace, and rofi has no concept of what an
 -- xmonad workspace is (not that it is supposed to, xmonad is weird...). Rofi
 -- accepts the name of an xrandr output onto which it should appear, so this
--- script provides a way to determine which xmonad workspace is in focus and
--- provide the name of the output displaying said workspace.
+-- binary determines which xmonad workspace is in focus and calls rofi with the
+-- name of that workspace.
 --
 -- Assumptions: xmonad sets the _NET_DESKTOP_VIEWPORT atom with the positions of
 -- the active workspace (actually an array of the positions of all workspaces
@@ -21,6 +21,7 @@ module Main (main) where
 -- 2) Use index from (1) and to get the position of the active workspace from
 --    _NET_DESKTOP_VIEWPORT
 -- 3) Find the name of the xrandr output whose position matches that from (2)
+-- 4) Call rofi with the '-m' flag to override the default monitor placement
 
 import           Data.Maybe
 
@@ -29,13 +30,17 @@ import           Graphics.X11.Xlib
 import           Graphics.X11.Xlib.Extras
 import           Graphics.X11.Xrandr
 
-import           System.Exit
+import           System.Environment
+import           System.Process
 
 main :: IO ()
-main = getMonitorName >>= maybe exitFailure (\n -> putStrLn n >> exitSuccess)
+main = do
+  r <- getMonitorName
+  let pre = maybe [] (\n -> ["-m", n]) r
+  args <- getArgs
+  callProcess "/usr/bin/rofi" $ pre ++ args
 
-data Coord = Coord Int Int
-    deriving (Eq, Show)
+data Coord = Coord Int Int deriving (Eq, Show)
 
 getMonitorName :: IO (Maybe String)
 getMonitorName = do
@@ -55,9 +60,8 @@ getDesktopViewports dpy root =
   pairs <$> getAtom32 dpy root "_NET_DESKTOP_VIEWPORT"
   where
     pairs = reverse . pairs' []
-    pairs' acc []         = acc
-    pairs' acc [_]        = acc
     pairs' acc (x1:x2:xs) = pairs' (Coord x1 x2 : acc) xs
+    pairs' acc _          = acc
 
 getOutputs :: Display -> Window -> IO [(Coord, String)]
 getOutputs dpy root = xrrGetScreenResourcesCurrent dpy root >>=
@@ -70,8 +74,7 @@ getOutputs dpy root = xrrGetScreenResourcesCurrent dpy root >>=
                                      , xrr_oi_name = n
                                      , xrr_oi_crtc = c
                                      }) = do
-      cinfo <- xrrGetCrtcInfo dpy r c
-      return $ fmap (\i -> (toCoord i, n)) cinfo
+      fmap (\i -> (toCoord i, n)) <$> xrrGetCrtcInfo dpy r c
     infoToCell _ _ = return Nothing
     toCoord c = Coord (fromIntegral $ xrr_ci_x c) (fromIntegral $ xrr_ci_y c)
 
@@ -79,12 +82,7 @@ infix 9 !!?
 (!!?) :: [a] -> Int -> Maybe a
 (!!?) xs i
     | i < 0     = Nothing
-    | otherwise = go i xs
-  where
-    go :: Int -> [a] -> Maybe a
-    go 0 (x:_)  = Just x
-    go j (_:ys) = go (j - 1) ys
-    go _ []     = Nothing
+    | otherwise = listToMaybe $ drop i xs
 
 getAtom32 :: Display -> Window -> String -> IO [Int]
 getAtom32 dpy root str = do
